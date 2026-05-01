@@ -2,6 +2,7 @@ import hashlib
 import logging
 import os
 import tempfile
+import time
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -9,23 +10,31 @@ import streamlit as st
 from PyPDF2 import PdfReader
 from dotenv import load_dotenv
 
-from langchain.chains import ConversationalRetrievalChain
 from langchain.schema import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.prompts import PromptTemplate
 
 
 APP_TITLE = "Chatify"
-DEFAULT_EMBEDDING_MODEL = "BAAI/bge-m3"
+DEFAULT_EMBEDDING_BACKEND = "fastembed"
+DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 DEFAULT_OLLAMA_MODEL = "frob/qwen3.5-instruct:4b"  # Change this to your Ollama model name if different
 DEFAULT_LLM_PROVIDER = "Ollama"
 DEFAULT_TEMPERATURE = 0.1
 DEFAULT_MAX_OUTPUT_TOKENS = 512
+DEFAULT_RETRIEVAL_K = 3
+DEFAULT_MAX_CONTEXT_CHARS = 5000
+DEFAULT_CHUNK_SIZE = 1800
+DEFAULT_CHUNK_OVERLAP = 150
+DEFAULT_SUMMARY_CHUNKS = 16
+DEFAULT_SUMMARY_MAX_CHARS = 24000
 CHROMA_DIR = ".chroma"
+FASTEMBED_CACHE_DIR = ".fastembed_cache"
 EMBEDDING_MODEL_ALIASES = {
     "bge-m3": "BAAI/bge-m3",
+    "bge-small": "BAAI/bge-small-en-v1.5",
+    "minilm": "sentence-transformers/all-MiniLM-L6-v2",
     "sentence-transformers/bge-m3": "BAAI/bge-m3",
 }
 
@@ -90,14 +99,15 @@ def read_pdf(uploaded_file) -> PdfPayload:
     )
 
 
-def split_pdf(payload: PdfPayload) -> list[Document]:
+def split_pdf(payload: PdfPayload, chunk_size: int, chunk_overlap: int) -> list[Document]:
+    start = time.perf_counter()
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1200,
-        chunk_overlap=180,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
         separators=["\n\n", "\n", ". ", " ", ""],
     )
     chunks = splitter.split_text(payload.text)
-    return [
+    docs = [
         Document(
             page_content=chunk,
             metadata={
@@ -108,26 +118,52 @@ def split_pdf(payload: PdfPayload) -> list[Document]:
         )
         for index, chunk in enumerate(chunks)
     ]
+    logger.info(
+        "Split %s pages into %s chunks in %.2fs using chunk_size=%s chunk_overlap=%s",
+        payload.page_count,
+        len(docs),
+        time.perf_counter() - start,
+        chunk_size,
+        chunk_overlap,
+    )
+    return docs
 
 
 @st.cache_resource(show_spinner=False)
-def get_embeddings(model_name: str):
+def get_embeddings(backend: str, model_name: str):
     normalized_model_name = EMBEDDING_MODEL_ALIASES.get(model_name.strip(), model_name.strip())
+    start = time.perf_counter()
+
+    if backend == "fastembed":
+        from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
+
+        embeddings = FastEmbedEmbeddings(
+            model_name=normalized_model_name,
+            cache_dir=FASTEMBED_CACHE_DIR,
+            batch_size=256,
+        )
+        logger.info("Loaded FastEmbed model %s in %.2fs", normalized_model_name, time.perf_counter() - start)
+        return embeddings
+
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+
     model_kwargs = {"device": "cpu"}
     hf_token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
     if hf_token:
         model_kwargs["token"] = hf_token
 
-    return HuggingFaceEmbeddings(
+    embeddings = HuggingFaceEmbeddings(
         model_name=normalized_model_name,
         model_kwargs=model_kwargs,
         encode_kwargs={"normalize_embeddings": True},
     )
+    logger.info("Loaded Sentence Transformers model %s in %.2fs", normalized_model_name, time.perf_counter() - start)
+    return embeddings
 
 
-def build_vector_store(file_hash: str, embedding_model: str, docs: list[Document]):
-    embeddings = get_embeddings(embedding_model)
-    embedding_hash = hashlib.sha256(embedding_model.encode("utf-8")).hexdigest()[:8]
+def build_vector_store(file_hash: str, embedding_backend: str, embedding_model: str, docs: list[Document]):
+    embeddings = get_embeddings(embedding_backend, embedding_model)
+    embedding_hash = hashlib.sha256(f"{embedding_backend}:{embedding_model}".encode("utf-8")).hexdigest()[:8]
     collection_name = f"pdf_{file_hash}_{embedding_hash}"
     vector_store = Chroma(
         collection_name=collection_name,
@@ -136,21 +172,27 @@ def build_vector_store(file_hash: str, embedding_model: str, docs: list[Document
     )
 
     if vector_store._collection.count() > 0:
-        logger.info("Loaded existing Chroma collection %s", collection_name)
+        logger.info("Loaded existing Chroma collection %s with %s vectors", collection_name, vector_store._collection.count())
         return vector_store
 
     logger.info(
-        "Creating Chroma collection %s with %s chunks using %s",
+        "Creating Chroma collection %s with %s chunks using %s/%s",
         collection_name,
         len(docs),
+        embedding_backend,
         embedding_model,
     )
-    return Chroma.from_documents(
+    start = time.perf_counter()
+    ids = [f"{file_hash}-{doc.metadata['chunk']}" for doc in docs]
+    vector_store = Chroma.from_documents(
         documents=docs,
         embedding=embeddings,
+        ids=ids,
         collection_name=collection_name,
         persist_directory=CHROMA_DIR,
     )
+    logger.info("Created Chroma collection in %.2fs", time.perf_counter() - start)
+    return vector_store
 
 
 def get_llm(provider: str, model_name: str, temperature: float, api_key: str | None, max_output_tokens: int):
@@ -181,15 +223,25 @@ def get_llm(provider: str, model_name: str, temperature: float, api_key: str | N
 
 
 SUMMARY_PROMPT = PromptTemplate.from_template(
-    """You are summarizing a PDF for a reader. /no_think
+    """You are explaining a PDF for a reader. /no_think
 
-Write a concise summary using only the document content below.
+Write an explanatory guide using only the document content below.
 Do not include hidden reasoning, chain-of-thought, or <think> text.
-Keep the whole answer under 180 words.
-Include:
-- The main topic
-- 3 to 5 important points
-- Any key names, dates, numbers, tools, or actions if present
+Do not only say what the document is about. Explain the actual content so a reader can understand it without reading the PDF.
+
+Use this structure:
+
+## Plain-language explanation
+Explain the document's ideas step by step. Define important terms, explain why each idea matters, and connect related points.
+
+## Key details from the document
+List the important facts, examples, tools, commands, names, dates, numbers, warnings, or procedures that appear in the content.
+
+## What the reader should understand
+Explain the main takeaways and how the pieces fit together.
+
+## Good follow-up questions
+Suggest questions the reader can ask to understand unclear or advanced parts.
 
 Document content:
 {context}
@@ -199,8 +251,10 @@ Summary:"""
 
 
 QA_PROMPT = PromptTemplate.from_template(
-    """You answer questions about one uploaded PDF.
+    """You answer questions about one uploaded PDF. /no_think
 Use only the context below. If the answer is not in the PDF, say that the document does not contain enough information.
+Do not include hidden reasoning, chain-of-thought, or <think> text.
+Keep the answer concise and practical.
 
 Context:
 {context}
@@ -211,10 +265,21 @@ Answer:"""
 )
 
 
-def build_summary_prompt(docs: Iterable[Document]) -> str:
-    selected_docs = list(docs)[:8]
+def select_summary_docs(docs: list[Document], summary_chunks: int) -> list[Document]:
+    if len(docs) <= summary_chunks:
+        return docs
+
+    selected_indexes = {
+        round(index * (len(docs) - 1) / (summary_chunks - 1))
+        for index in range(summary_chunks)
+    }
+    return [docs[index] for index in sorted(selected_indexes)]
+
+
+def build_summary_prompt(docs: Iterable[Document], summary_chunks: int, summary_max_chars: int) -> str:
+    selected_docs = select_summary_docs(list(docs), summary_chunks)
     context = "\n\n".join(doc.page_content for doc in selected_docs)
-    context = context[:8000]
+    context = context[:summary_max_chars]
     return SUMMARY_PROMPT.format(context=context)
 
 
@@ -225,22 +290,41 @@ def stream_llm_text(llm, prompt: str):
             yield str(content)
 
 
-def make_chat_chain(llm, vector_store):
-    retriever = vector_store.as_retriever(search_kwargs={"k": 5})
-    return ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=retriever,
-        combine_docs_chain_kwargs={"prompt": QA_PROMPT},
-        return_source_documents=True,
-    )
+def retrieve_context(vector_store, question: str, retrieval_k: int, max_context_chars: int) -> tuple[str, list[Document]]:
+    start = time.perf_counter()
+    docs = vector_store.similarity_search(question, k=retrieval_k)
+    elapsed = time.perf_counter() - start
+    logger.info("Retrieved %s chunks in %.2fs", len(docs), elapsed)
+
+    context_parts = []
+    remaining_chars = max_context_chars
+    for doc in docs:
+        if remaining_chars <= 0:
+            break
+        content = doc.page_content[:remaining_chars]
+        context_parts.append(content)
+        remaining_chars -= len(content)
+
+    return "\n\n".join(context_parts), docs
+
+
+def build_qa_prompt(question: str, context: str) -> str:
+    return QA_PROMPT.format(context=context, question=question)
 
 
 def get_app_config():
     provider = os.getenv("LLM_PROVIDER", DEFAULT_LLM_PROVIDER)
+    embedding_backend = os.getenv("EMBEDDING_BACKEND", DEFAULT_EMBEDDING_BACKEND).strip().lower()
     embedding_model = os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
     normalized_embedding_model = EMBEDDING_MODEL_ALIASES.get(embedding_model.strip(), embedding_model.strip())
     temperature = float(os.getenv("LLM_TEMPERATURE", DEFAULT_TEMPERATURE))
     max_output_tokens = int(os.getenv("MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS))
+    retrieval_k = int(os.getenv("RETRIEVAL_K", DEFAULT_RETRIEVAL_K))
+    max_context_chars = int(os.getenv("MAX_CONTEXT_CHARS", DEFAULT_MAX_CONTEXT_CHARS))
+    chunk_size = int(os.getenv("CHUNK_SIZE", DEFAULT_CHUNK_SIZE))
+    chunk_overlap = int(os.getenv("CHUNK_OVERLAP", DEFAULT_CHUNK_OVERLAP))
+    summary_chunks = int(os.getenv("SUMMARY_CHUNKS", DEFAULT_SUMMARY_CHUNKS))
+    summary_max_chars = int(os.getenv("SUMMARY_MAX_CHARS", DEFAULT_SUMMARY_MAX_CHARS))
 
     if provider == "OpenAI":
         model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -253,7 +337,21 @@ def get_app_config():
         model_name = os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
         api_key = None
 
-    return provider, model_name, api_key, normalized_embedding_model, temperature, max_output_tokens
+    return (
+        provider,
+        model_name,
+        api_key,
+        embedding_backend,
+        normalized_embedding_model,
+        temperature,
+        max_output_tokens,
+        retrieval_k,
+        max_context_chars,
+        chunk_size,
+        chunk_overlap,
+        summary_chunks,
+        summary_max_chars,
+    )
 
 
 def ensure_session_defaults() -> None:
@@ -270,11 +368,31 @@ def main() -> None:
     init_page()
     ensure_session_defaults()
 
-    provider, model_name, api_key, embedding_model, temperature, max_output_tokens = get_app_config()
-    uploaded_file = st.file_uploader("Upload a PDF file", type=["pdf"], key=f"pdf_uploader_{st.session_state.uploader_key}")
+    (
+        provider,
+        model_name,
+        api_key,
+        embedding_backend,
+        embedding_model,
+        temperature,
+        max_output_tokens,
+        retrieval_k,
+        max_context_chars,
+        chunk_size,
+        chunk_overlap,
+        summary_chunks,
+        summary_max_chars,
+    ) = get_app_config()
+    uploaded_file = st.file_uploader(
+        "Drop your PDF here",
+        type=["pdf"],
+        accept_multiple_files=False,
+        help="Drag and drop a PDF file here, or click Browse files.",
+        key=f"pdf_uploader_{st.session_state.uploader_key}",
+    )
 
     if not uploaded_file:
-        st.info("Choose a PDF to begin.")
+        st.info("Drop a PDF file above to generate a summary and start chatting with it.")
         return
 
     with st.spinner("Reading PDF..."):
@@ -290,7 +408,7 @@ def main() -> None:
         st.session_state.summary = ""
         st.session_state.active_file_hash = payload.file_hash
 
-    docs = split_pdf(payload)
+    docs = split_pdf(payload, chunk_size, chunk_overlap)
 
     col_meta, col_summary = st.columns([1, 2])
     with col_meta:
@@ -300,7 +418,7 @@ def main() -> None:
         st.write(f"**Chunks:** {len(docs)}")
 
     try:
-        index_key = f"{payload.file_hash}:{embedding_model}"
+        index_key = f"{payload.file_hash}:{embedding_backend}:{embedding_model}:{chunk_size}:{chunk_overlap}"
         with st.spinner("Indexing document..."):
             if index_key != st.session_state.active_index_key:
                 logger.info(
@@ -309,7 +427,7 @@ def main() -> None:
                     payload.file_name,
                     len(docs),
                 )
-                st.session_state.vector_store = build_vector_store(payload.file_hash, embedding_model, docs)
+                st.session_state.vector_store = build_vector_store(payload.file_hash, embedding_backend, embedding_model, docs)
                 st.session_state.active_index_key = index_key
             vector_store = st.session_state.vector_store
         llm = get_llm(provider, model_name, temperature, api_key, max_output_tokens)
@@ -323,7 +441,7 @@ def main() -> None:
         if not st.session_state.summary:
             try:
                 logger.info("Starting summary with provider=%s model=%s", provider, model_name)
-                prompt = build_summary_prompt(docs)
+                prompt = build_summary_prompt(docs, summary_chunks, summary_max_chars)
                 summary_box = st.empty()
                 summary_parts = []
                 with st.spinner("Summarizing PDF..."):
@@ -354,19 +472,21 @@ def main() -> None:
         st.markdown(question)
 
     try:
-        chat_chain = make_chat_chain(llm, vector_store)
         with st.chat_message("assistant"):
             with st.spinner("Searching the PDF..."):
-                response = chat_chain.invoke(
-                    {
-                        "question": question,
-                        "chat_history": st.session_state.chat_history,
-                    }
-                )
-            answer = response["answer"]
-            st.markdown(answer)
+                context, sources = retrieve_context(vector_store, question, retrieval_k, max_context_chars)
 
-            sources = response.get("source_documents", [])
+            answer_box = st.empty()
+            answer_parts = []
+            prompt = build_qa_prompt(question, context)
+            logger.info("Starting answer with provider=%s model=%s", provider, model_name)
+            generation_start = time.perf_counter()
+            for token in stream_llm_text(llm, prompt):
+                answer_parts.append(token)
+                answer_box.markdown("".join(answer_parts))
+            answer = "".join(answer_parts)
+            logger.info("Answer finished in %.2fs with %s characters", time.perf_counter() - generation_start, len(answer))
+
             if sources:
                 with st.expander("Retrieved context"):
                     for source in sources:
