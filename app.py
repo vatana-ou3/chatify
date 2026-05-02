@@ -19,10 +19,11 @@ from langchain_core.prompts import PromptTemplate
 APP_TITLE = "Chatify"
 DEFAULT_EMBEDDING_BACKEND = "fastembed"
 DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+DEFAULT_OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_OLLAMA_MODEL = "frob/qwen3.5-instruct:4b"  # Change this to your Ollama model name if different
 DEFAULT_LLM_PROVIDER = "Ollama"
 DEFAULT_TEMPERATURE = 0.1
-DEFAULT_MAX_OUTPUT_TOKENS = 512
+DEFAULT_MAX_OUTPUT_TOKENS = 1200
 DEFAULT_RETRIEVAL_K = 3
 DEFAULT_MAX_CONTEXT_CHARS = 5000
 DEFAULT_CHUNK_SIZE = 1800
@@ -30,6 +31,7 @@ DEFAULT_CHUNK_OVERLAP = 150
 DEFAULT_SUMMARY_CHUNKS = 16
 DEFAULT_SUMMARY_MAX_CHARS = 24000
 DEFAULT_EXHAUSTIVE_BATCH_CHARS = 5000
+DEFAULT_QUIZ_QUESTION_COUNT = 5
 CHROMA_DIR = ".chroma"
 FASTEMBED_CACHE_DIR = ".fastembed_cache"
 EMBEDDING_MODEL_ALIASES = {
@@ -37,6 +39,7 @@ EMBEDDING_MODEL_ALIASES = {
     "bge-small": "BAAI/bge-small-en-v1.5",
     "minilm": "sentence-transformers/all-MiniLM-L6-v2",
     "sentence-transformers/bge-m3": "BAAI/bge-m3",
+    "openai-small": DEFAULT_OPENAI_EMBEDDING_MODEL,
 }
 
 logging.basicConfig(level=logging.INFO)
@@ -49,6 +52,23 @@ class PdfPayload:
     file_name: str
     text: str
     page_count: int
+
+
+def get_secret(name: str) -> str | None:
+    value = os.getenv(name)
+    if value:
+        return value
+
+    try:
+        value = st.secrets.get(name)
+    except Exception:
+        return None
+
+    return str(value) if value else None
+
+
+def get_config_value(name: str, default: str | None = None) -> str | None:
+    return get_secret(name) or default
 
 
 def init_page() -> None:
@@ -68,6 +88,8 @@ def reset_chat() -> None:
     st.session_state.messages = []
     st.session_state.chat_history = []
     st.session_state.summary = ""
+    st.session_state.quiz = ""
+    st.session_state.quiz_batch_count = 0
     st.session_state.active_file_hash = ""
     st.session_state.active_index_key = ""
     st.session_state.vector_store = None
@@ -135,6 +157,16 @@ def get_embeddings(backend: str, model_name: str):
     normalized_model_name = EMBEDDING_MODEL_ALIASES.get(model_name.strip(), model_name.strip())
     start = time.perf_counter()
 
+    if backend == "openai":
+        from langchain_openai import OpenAIEmbeddings
+
+        embeddings = OpenAIEmbeddings(
+            model=normalized_model_name or DEFAULT_OPENAI_EMBEDDING_MODEL,
+            api_key=get_secret("OPENAI_API_KEY"),
+        )
+        logger.info("Loaded OpenAI embedding model %s in %.2fs", normalized_model_name, time.perf_counter() - start)
+        return embeddings
+
     if backend == "fastembed":
         from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
 
@@ -149,7 +181,7 @@ def get_embeddings(backend: str, model_name: str):
     from langchain_community.embeddings import HuggingFaceEmbeddings
 
     model_kwargs = {"device": "cpu"}
-    hf_token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
+    hf_token = get_secret("HUGGINGFACEHUB_API_TOKEN")
     if hf_token:
         model_kwargs["token"] = hf_token
 
@@ -204,7 +236,7 @@ def get_llm(provider: str, model_name: str, temperature: float, api_key: str | N
             model=model_name,
             temperature=temperature,
             max_tokens=max_output_tokens,
-            api_key=api_key or os.getenv("OPENAI_API_KEY"),
+            api_key=api_key or get_secret("OPENAI_API_KEY"),
         )
 
     if provider == "Hugging Face":
@@ -214,7 +246,7 @@ def get_llm(provider: str, model_name: str, temperature: float, api_key: str | N
             repo_id=model_name,
             temperature=temperature,
             max_new_tokens=max_output_tokens,
-            huggingfacehub_api_token=api_key or os.getenv("HUGGINGFACEHUB_API_TOKEN"),
+            huggingfacehub_api_token=api_key or get_secret("HUGGINGFACEHUB_API_TOKEN"),
         )
         return ChatHuggingFace(llm=endpoint)
 
@@ -296,6 +328,68 @@ Notes from the full document:
 {context}
 
 Answer:"""
+)
+
+
+QUIZ_BATCH_PROMPT = PromptTemplate.from_template(
+    """You are preparing a document-grounded quiz. /no_think
+Use only the document section below.
+Do not include hidden reasoning, chain-of-thought, or <think> text.
+
+Quiz type: {quiz_type}
+Difficulty: {difficulty}
+Target final question count: {question_count}
+
+Document section:
+{context}
+
+Extract useful quiz material from this section. Include important facts, concepts, definitions, procedures, examples, numbers, names, dates, warnings, or relationships.
+Prefer material that can support clear questions. If this section has no useful quiz material, say: No useful quiz material.
+
+Quiz material:"""
+)
+
+
+QUIZ_FINAL_PROMPT = PromptTemplate.from_template(
+    """Create a quiz from one uploaded PDF. /no_think
+Use only the document material below.
+Do not include hidden reasoning, chain-of-thought, or <think> text.
+
+Quiz type: {quiz_type}
+Difficulty: {difficulty}
+Number of questions: {question_count}
+
+Rules:
+- Generate exactly {question_count} questions.
+- Keep every question answerable from the document material.
+- Spread questions across the available material when possible.
+- Do not mention information that is not supported by the material.
+- For QCM/MCQ questions, provide 4 options labeled A-D, mark the correct answer, and add a short explanation.
+- For context/open questions, provide the expected answer and a short explanation.
+- If difficulty is Mixed, include a balanced mix of easy, medium, and hard questions.
+- If quiz type is Mixed, include both QCM/MCQ and context/open questions.
+
+Format:
+## Quiz
+
+### 1. [Question type] [Difficulty]
+Question text
+
+Options:
+A. ...
+B. ...
+C. ...
+D. ...
+
+Answer: ...
+Explanation: ...
+
+For context/open questions, omit the Options block.
+
+Document material:
+{context}
+
+Quiz:"""
 )
 
 
@@ -427,34 +521,90 @@ def answer_from_full_document(llm, question: str, docs: list[Document], max_cont
     return get_llm_text(llm, final_prompt), batches
 
 
+def generate_quiz(
+    llm,
+    docs: list[Document],
+    question_count: int,
+    quiz_type: str,
+    difficulty: str,
+    max_context_chars: int,
+) -> tuple[str, list[str]]:
+    batches = pack_docs_for_context(docs, max_context_chars)
+    material_parts = []
+
+    for batch_number, context in enumerate(batches, start=1):
+        prompt = QUIZ_BATCH_PROMPT.format(
+            quiz_type=quiz_type,
+            difficulty=difficulty,
+            question_count=question_count,
+            context=context,
+        )
+        material = get_llm_text(llm, prompt).strip()
+        if material and "no useful quiz material" not in material.lower():
+            material_parts.append(f"[Section {batch_number}]\n{material}")
+
+    if not material_parts:
+        material_parts = ["No useful quiz material was found in the extracted document text."]
+
+    while len("\n\n".join(material_parts)) > max_context_chars and len(material_parts) > 1:
+        reduced_parts = []
+        for context in pack_docs_for_context(
+            [Document(page_content=material, metadata={"chunk": index}) for index, material in enumerate(material_parts)],
+            max_context_chars,
+        ):
+            prompt = QUIZ_BATCH_PROMPT.format(
+                quiz_type=quiz_type,
+                difficulty=difficulty,
+                question_count=question_count,
+                context=context,
+            )
+            reduced = get_llm_text(llm, prompt).strip()
+            if reduced:
+                reduced_parts.append(reduced)
+        material_parts = reduced_parts or material_parts[:1]
+
+    final_context = "\n\n".join(material_parts)[:max_context_chars]
+    final_prompt = QUIZ_FINAL_PROMPT.format(
+        quiz_type=quiz_type,
+        difficulty=difficulty,
+        question_count=question_count,
+        context=final_context,
+    )
+    return get_llm_text(llm, final_prompt), batches
+
+
 def build_qa_prompt(question: str, context: str) -> str:
     return QA_PROMPT.format(context=context, question=question)
 
 
 def get_app_config():
-    provider = os.getenv("LLM_PROVIDER", DEFAULT_LLM_PROVIDER)
-    embedding_backend = os.getenv("EMBEDDING_BACKEND", DEFAULT_EMBEDDING_BACKEND).strip().lower()
-    embedding_model = os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
+    provider = get_config_value("LLM_PROVIDER", DEFAULT_LLM_PROVIDER)
+    embedding_backend = get_config_value("EMBEDDING_BACKEND", DEFAULT_EMBEDDING_BACKEND).strip().lower()
+    default_embedding_model = DEFAULT_OPENAI_EMBEDDING_MODEL if embedding_backend == "openai" else DEFAULT_EMBEDDING_MODEL
+    embedding_model = get_config_value(
+        "EMBEDDING_MODEL",
+        get_config_value("OPENAI_EMBEDDING_MODEL", default_embedding_model),
+    )
     normalized_embedding_model = EMBEDDING_MODEL_ALIASES.get(embedding_model.strip(), embedding_model.strip())
-    temperature = float(os.getenv("LLM_TEMPERATURE", DEFAULT_TEMPERATURE))
-    max_output_tokens = int(os.getenv("MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS))
-    retrieval_k = int(os.getenv("RETRIEVAL_K", DEFAULT_RETRIEVAL_K))
-    max_context_chars = int(os.getenv("MAX_CONTEXT_CHARS", DEFAULT_MAX_CONTEXT_CHARS))
-    chunk_size = int(os.getenv("CHUNK_SIZE", DEFAULT_CHUNK_SIZE))
-    chunk_overlap = int(os.getenv("CHUNK_OVERLAP", DEFAULT_CHUNK_OVERLAP))
-    summary_chunks = int(os.getenv("SUMMARY_CHUNKS", DEFAULT_SUMMARY_CHUNKS))
-    summary_max_chars = int(os.getenv("SUMMARY_MAX_CHARS", DEFAULT_SUMMARY_MAX_CHARS))
-    exhaustive_batch_chars = int(os.getenv("EXHAUSTIVE_BATCH_CHARS", DEFAULT_EXHAUSTIVE_BATCH_CHARS))
+    temperature = float(get_config_value("LLM_TEMPERATURE", str(DEFAULT_TEMPERATURE)))
+    max_output_tokens = int(get_config_value("MAX_OUTPUT_TOKENS", str(DEFAULT_MAX_OUTPUT_TOKENS)))
+    retrieval_k = int(get_config_value("RETRIEVAL_K", str(DEFAULT_RETRIEVAL_K)))
+    max_context_chars = int(get_config_value("MAX_CONTEXT_CHARS", str(DEFAULT_MAX_CONTEXT_CHARS)))
+    chunk_size = int(get_config_value("CHUNK_SIZE", str(DEFAULT_CHUNK_SIZE)))
+    chunk_overlap = int(get_config_value("CHUNK_OVERLAP", str(DEFAULT_CHUNK_OVERLAP)))
+    summary_chunks = int(get_config_value("SUMMARY_CHUNKS", str(DEFAULT_SUMMARY_CHUNKS)))
+    summary_max_chars = int(get_config_value("SUMMARY_MAX_CHARS", str(DEFAULT_SUMMARY_MAX_CHARS)))
+    exhaustive_batch_chars = int(get_config_value("EXHAUSTIVE_BATCH_CHARS", str(DEFAULT_EXHAUSTIVE_BATCH_CHARS)))
 
     if provider == "OpenAI":
-        model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        api_key = os.getenv("OPENAI_API_KEY")
+        model_name = get_config_value("OPENAI_MODEL", "gpt-4o-mini")
+        api_key = get_secret("OPENAI_API_KEY")
     elif provider == "Hugging Face":
-        model_name = os.getenv("HUGGINGFACE_MODEL", "Qwen/Qwen2.5-7B-Instruct")
-        api_key = os.getenv("HUGGINGFACEHUB_API_TOKEN")
+        model_name = get_config_value("HUGGINGFACE_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+        api_key = get_secret("HUGGINGFACEHUB_API_TOKEN")
     else:
         provider = "Ollama"
-        model_name = os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
+        model_name = get_config_value("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
         api_key = None
 
     return (
@@ -479,10 +629,44 @@ def ensure_session_defaults() -> None:
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("chat_history", [])
     st.session_state.setdefault("summary", "")
+    st.session_state.setdefault("quiz", "")
+    st.session_state.setdefault("quiz_batch_count", 0)
     st.session_state.setdefault("active_file_hash", "")
     st.session_state.setdefault("active_index_key", "")
     st.session_state.setdefault("vector_store", None)
     st.session_state.setdefault("uploader_key", 0)
+
+
+def render_quiz_controls(max_output_tokens: int) -> tuple[str, str, int]:
+    control_cols = st.columns([1, 1, 1])
+    with control_cols[0]:
+        quiz_type = st.selectbox(
+            "Question type",
+            ["QCM / multiple choice", "Context questions", "Mixed"],
+            help="QCM creates four-option multiple-choice questions. Context questions are open-ended.",
+        )
+    with control_cols[1]:
+        difficulty = st.selectbox(
+            "Difficulty",
+            ["Easy", "Medium", "Hard", "Mixed"],
+            index=1,
+        )
+    with control_cols[2]:
+        question_count = st.number_input(
+            "Number of questions",
+            min_value=1,
+            max_value=30,
+            value=DEFAULT_QUIZ_QUESTION_COUNT,
+            step=1,
+        )
+
+    if question_count > 8 and max_output_tokens < 1200:
+        st.warning(
+            "Your current MAX_OUTPUT_TOKENS is low for a large quiz. The model may stop early; increase it in .env for longer quizzes.",
+            icon="!",
+        )
+
+    return quiz_type, difficulty, int(question_count)
 
 
 def main() -> None:
@@ -528,6 +712,8 @@ def main() -> None:
         st.session_state.messages = []
         st.session_state.chat_history = []
         st.session_state.summary = ""
+        st.session_state.quiz = ""
+        st.session_state.quiz_batch_count = 0
         st.session_state.active_file_hash = payload.file_hash
 
     docs = split_pdf(payload, chunk_size, chunk_overlap)
@@ -579,70 +765,106 @@ def main() -> None:
             st.markdown(st.session_state.summary)
 
     st.divider()
-    st.subheader("Chat with this PDF")
-    search_full_document = st.toggle(
-        "Search whole document",
-        value=False,
-        help="Use this for broad questions that need every chunk. Broad prompts are also detected automatically. It is slower, but it reads the PDF in batches instead of only retrieving the nearest chunks.",
-    )
+    chat_tab, quiz_tab = st.tabs(["Chat", "Quiz"])
 
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+    with quiz_tab:
+        st.subheader("Create a quiz")
+        quiz_type, difficulty, question_count = render_quiz_controls(max_output_tokens)
 
-    question = st.chat_input("Ask a question about the uploaded PDF")
-    if not question:
-        return
-
-    st.session_state.messages.append({"role": "user", "content": question})
-    with st.chat_message("user"):
-        st.markdown(question)
-
-    try:
-        with st.chat_message("assistant"):
-            answer_box = st.empty()
-            answer_parts = []
-            generation_start = time.perf_counter()
-            exhaustive_search = search_full_document or should_search_full_document(question)
-
-            if exhaustive_search:
-                with st.spinner("Reading the whole PDF in batches..."):
-                    answer, batches = answer_from_full_document(llm, question, docs, exhaustive_batch_chars)
-                answer_box.markdown(answer)
+        if st.button("Generate quiz", type="primary", use_container_width=True):
+            try:
+                start = time.perf_counter()
+                with st.spinner("Creating quiz from the whole document..."):
+                    quiz, batches = generate_quiz(
+                        llm,
+                        docs,
+                        question_count,
+                        quiz_type,
+                        difficulty,
+                        exhaustive_batch_chars,
+                    )
+                st.session_state.quiz = quiz
+                st.session_state.quiz_batch_count = len(batches)
                 logger.info(
-                    "Full-document answer finished in %.2fs with %s batches and %s characters",
-                    time.perf_counter() - generation_start,
+                    "Quiz generated in %.2fs with %s batches and %s characters",
+                    time.perf_counter() - start,
                     len(batches),
-                    len(answer),
+                    len(quiz),
                 )
-                with st.expander("Document batches scanned"):
-                    st.caption(f"Scanned {len(docs)} chunks in {len(batches)} context-window-sized batches.")
-                    for batch_number, batch in enumerate(batches, start=1):
-                        st.caption(f"Batch {batch_number}")
-                        st.write(batch[:1200])
-            else:
-                with st.spinner("Searching the PDF..."):
-                    context, sources = retrieve_context(vector_store, question, retrieval_k, max_context_chars)
+            except Exception as exc:
+                logger.exception("Quiz generation failed")
+                st.error(f"Quiz generation failed: {exc}")
 
-                prompt = build_qa_prompt(question, context)
-                logger.info("Starting answer with provider=%s model=%s", provider, model_name)
-                for token in stream_llm_text(llm, prompt):
-                    answer_parts.append(token)
-                    answer_box.markdown("".join(answer_parts))
-                answer = "".join(answer_parts)
-                logger.info("Answer finished in %.2fs with %s characters", time.perf_counter() - generation_start, len(answer))
+        if st.session_state.quiz:
+            if st.session_state.quiz_batch_count:
+                st.caption(f"Quiz generated from {len(docs)} chunks across {st.session_state.quiz_batch_count} batches.")
+            st.markdown(st.session_state.quiz)
 
-                with st.expander("Retrieved context"):
-                    for source in sources:
-                        chunk = source.metadata.get("chunk", "?")
-                        st.caption(f"Chunk {chunk}")
-                        st.write(source.page_content[:800])
+    with chat_tab:
+        st.subheader("Chat with this PDF")
+        search_full_document = st.toggle(
+            "Search whole document",
+            value=False,
+            help="Use this for broad questions that need every chunk. Broad prompts are also detected automatically. It is slower, but it reads the PDF in batches instead of only retrieving the nearest chunks.",
+        )
 
-        st.session_state.messages.append({"role": "assistant", "content": answer})
-        st.session_state.chat_history.append((question, answer))
-    except Exception as exc:
-        logger.exception("Chat failed")
-        st.error(f"Chat failed: {exc}")
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+
+        question = st.chat_input("Ask a question about the uploaded PDF")
+        if not question:
+            return
+
+        st.session_state.messages.append({"role": "user", "content": question})
+        with st.chat_message("user"):
+            st.markdown(question)
+
+        try:
+            with st.chat_message("assistant"):
+                answer_box = st.empty()
+                answer_parts = []
+                generation_start = time.perf_counter()
+                exhaustive_search = search_full_document or should_search_full_document(question)
+
+                if exhaustive_search:
+                    with st.spinner("Reading the whole PDF in batches..."):
+                        answer, batches = answer_from_full_document(llm, question, docs, exhaustive_batch_chars)
+                    answer_box.markdown(answer)
+                    logger.info(
+                        "Full-document answer finished in %.2fs with %s batches and %s characters",
+                        time.perf_counter() - generation_start,
+                        len(batches),
+                        len(answer),
+                    )
+                    with st.expander("Document batches scanned"):
+                        st.caption(f"Scanned {len(docs)} chunks in {len(batches)} context-window-sized batches.")
+                        for batch_number, batch in enumerate(batches, start=1):
+                            st.caption(f"Batch {batch_number}")
+                            st.write(batch[:1200])
+                else:
+                    with st.spinner("Searching the PDF..."):
+                        context, sources = retrieve_context(vector_store, question, retrieval_k, max_context_chars)
+
+                    prompt = build_qa_prompt(question, context)
+                    logger.info("Starting answer with provider=%s model=%s", provider, model_name)
+                    for token in stream_llm_text(llm, prompt):
+                        answer_parts.append(token)
+                        answer_box.markdown("".join(answer_parts))
+                    answer = "".join(answer_parts)
+                    logger.info("Answer finished in %.2fs with %s characters", time.perf_counter() - generation_start, len(answer))
+
+                    with st.expander("Retrieved context"):
+                        for source in sources:
+                            chunk = source.metadata.get("chunk", "?")
+                            st.caption(f"Chunk {chunk}")
+                            st.write(source.page_content[:800])
+
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+            st.session_state.chat_history.append((question, answer))
+        except Exception as exc:
+            logger.exception("Chat failed")
+            st.error(f"Chat failed: {exc}")
 
 
 if __name__ == "__main__":
