@@ -55,12 +55,12 @@ class PdfPayload:
 
 
 def get_secret(name: str) -> str | None:
-    value = os.getenv(name)
+    value = os.getenv(name) or os.getenv(name.lower())
     if value:
         return value
 
     try:
-        value = st.secrets.get(name)
+        value = st.secrets.get(name) or st.secrets.get(name.lower())
     except Exception:
         return None
 
@@ -578,7 +578,7 @@ def build_qa_prompt(question: str, context: str) -> str:
 
 
 def get_app_config():
-    provider = get_config_value("LLM_PROVIDER", DEFAULT_LLM_PROVIDER)
+    provider = get_config_value("LLM_PROVIDER", DEFAULT_LLM_PROVIDER).strip()
     embedding_backend = get_config_value("EMBEDDING_BACKEND", DEFAULT_EMBEDDING_BACKEND).strip().lower()
     default_embedding_model = DEFAULT_OPENAI_EMBEDDING_MODEL if embedding_backend == "openai" else DEFAULT_EMBEDDING_MODEL
     embedding_model = get_config_value(
@@ -596,10 +596,13 @@ def get_app_config():
     summary_max_chars = int(get_config_value("SUMMARY_MAX_CHARS", str(DEFAULT_SUMMARY_MAX_CHARS)))
     exhaustive_batch_chars = int(get_config_value("EXHAUSTIVE_BATCH_CHARS", str(DEFAULT_EXHAUSTIVE_BATCH_CHARS)))
 
-    if provider == "OpenAI":
+    provider_key = provider.lower()
+    if provider_key == "openai":
+        provider = "OpenAI"
         model_name = get_config_value("OPENAI_MODEL", "gpt-4o-mini")
         api_key = get_secret("OPENAI_API_KEY")
-    elif provider == "Hugging Face":
+    elif provider_key in {"hugging face", "huggingface"}:
+        provider = "Hugging Face"
         model_name = get_config_value("HUGGINGFACE_MODEL", "Qwen/Qwen2.5-7B-Instruct")
         api_key = get_secret("HUGGINGFACEHUB_API_TOKEN")
     else:
