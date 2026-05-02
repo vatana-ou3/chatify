@@ -29,6 +29,7 @@ DEFAULT_CHUNK_SIZE = 1800
 DEFAULT_CHUNK_OVERLAP = 150
 DEFAULT_SUMMARY_CHUNKS = 16
 DEFAULT_SUMMARY_MAX_CHARS = 24000
+DEFAULT_EXHAUSTIVE_BATCH_CHARS = 5000
 CHROMA_DIR = ".chroma"
 FASTEMBED_CACHE_DIR = ".fastembed_cache"
 EMBEDDING_MODEL_ALIASES = {
@@ -265,6 +266,39 @@ Answer:"""
 )
 
 
+EXHAUSTIVE_BATCH_PROMPT = PromptTemplate.from_template(
+    """You answer questions about one uploaded PDF. /no_think
+Use only the document section below.
+Do not include hidden reasoning, chain-of-thought, or <think> text.
+
+Question: {question}
+
+Document section:
+{context}
+
+Write concise notes that are directly useful for answering the question.
+If this section has no relevant information, say: No relevant information in this section.
+
+Section notes:"""
+)
+
+
+EXHAUSTIVE_FINAL_PROMPT = PromptTemplate.from_template(
+    """You answer questions about one uploaded PDF. /no_think
+Use only the notes below. These notes were produced by reading the PDF in sections, so they may cover different parts of the document.
+Do not include hidden reasoning, chain-of-thought, or <think> text.
+Keep the answer practical and mention when different sections add different details.
+If the notes do not contain enough information, say that the document does not contain enough information.
+
+Question: {question}
+
+Notes from the full document:
+{context}
+
+Answer:"""
+)
+
+
 def select_summary_docs(docs: list[Document], summary_chunks: int) -> list[Document]:
     if len(docs) <= summary_chunks:
         return docs
@@ -290,6 +324,63 @@ def stream_llm_text(llm, prompt: str):
             yield str(content)
 
 
+def get_llm_text(llm, prompt: str) -> str:
+    response = llm.invoke(prompt)
+    content = getattr(response, "content", response)
+    return str(content or "")
+
+
+def should_search_full_document(question: str) -> bool:
+    lowered = question.lower()
+    broad_phrases = (
+        "all contents",
+        "all content",
+        "entire document",
+        "entire pdf",
+        "whole document",
+        "whole pdf",
+        "full document",
+        "full pdf",
+        "everything",
+        "the rest",
+        "rest of",
+        "complete summary",
+        "summarize all",
+        "summarise all",
+    )
+    return any(phrase in lowered for phrase in broad_phrases)
+
+
+def doc_label(doc: Document) -> str:
+    chunk = doc.metadata.get("chunk", "?")
+    return f"[Chunk {chunk}]\n{doc.page_content}"
+
+
+def pack_docs_for_context(docs: Iterable[Document], max_context_chars: int) -> list[str]:
+    batches = []
+    current_parts = []
+    current_length = 0
+
+    for doc in docs:
+        text = doc_label(doc)
+        separator_length = 2 if current_parts else 0
+        if current_parts and current_length + separator_length + len(text) > max_context_chars:
+            batches.append("\n\n".join(current_parts))
+            current_parts = []
+            current_length = 0
+
+        if len(text) > max_context_chars:
+            text = text[:max_context_chars]
+
+        current_parts.append(text)
+        current_length += (2 if current_length else 0) + len(text)
+
+    if current_parts:
+        batches.append("\n\n".join(current_parts))
+
+    return batches
+
+
 def retrieve_context(vector_store, question: str, retrieval_k: int, max_context_chars: int) -> tuple[str, list[Document]]:
     start = time.perf_counter()
     docs = vector_store.similarity_search(question, k=retrieval_k)
@@ -306,6 +397,34 @@ def retrieve_context(vector_store, question: str, retrieval_k: int, max_context_
         remaining_chars -= len(content)
 
     return "\n\n".join(context_parts), docs
+
+
+def answer_from_full_document(llm, question: str, docs: list[Document], max_context_chars: int) -> tuple[str, list[str]]:
+    batches = pack_docs_for_context(docs, max_context_chars)
+    section_notes = []
+
+    for batch_number, context in enumerate(batches, start=1):
+        prompt = EXHAUSTIVE_BATCH_PROMPT.format(question=question, context=context)
+        notes = get_llm_text(llm, prompt).strip()
+        if notes and "no relevant information in this section" not in notes.lower():
+            section_notes.append(f"[Section {batch_number}]\n{notes}")
+
+    if not section_notes:
+        section_notes = ["No section contained relevant information for the question."]
+
+    while len("\n\n".join(section_notes)) > max_context_chars and len(section_notes) > 1:
+        reduced_notes = []
+        for context in pack_docs_for_context(
+            [Document(page_content=notes, metadata={"chunk": index}) for index, notes in enumerate(section_notes)],
+            max_context_chars,
+        ):
+            prompt = EXHAUSTIVE_BATCH_PROMPT.format(question=question, context=context)
+            reduced_notes.append(get_llm_text(llm, prompt).strip())
+        section_notes = [notes for notes in reduced_notes if notes]
+
+    final_context = "\n\n".join(section_notes)[:max_context_chars]
+    final_prompt = EXHAUSTIVE_FINAL_PROMPT.format(question=question, context=final_context)
+    return get_llm_text(llm, final_prompt), batches
 
 
 def build_qa_prompt(question: str, context: str) -> str:
@@ -325,6 +444,7 @@ def get_app_config():
     chunk_overlap = int(os.getenv("CHUNK_OVERLAP", DEFAULT_CHUNK_OVERLAP))
     summary_chunks = int(os.getenv("SUMMARY_CHUNKS", DEFAULT_SUMMARY_CHUNKS))
     summary_max_chars = int(os.getenv("SUMMARY_MAX_CHARS", DEFAULT_SUMMARY_MAX_CHARS))
+    exhaustive_batch_chars = int(os.getenv("EXHAUSTIVE_BATCH_CHARS", DEFAULT_EXHAUSTIVE_BATCH_CHARS))
 
     if provider == "OpenAI":
         model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -351,6 +471,7 @@ def get_app_config():
         chunk_overlap,
         summary_chunks,
         summary_max_chars,
+        exhaustive_batch_chars,
     )
 
 
@@ -382,6 +503,7 @@ def main() -> None:
         chunk_overlap,
         summary_chunks,
         summary_max_chars,
+        exhaustive_batch_chars,
     ) = get_app_config()
     uploaded_file = st.file_uploader(
         "Drop your PDF here",
@@ -458,6 +580,11 @@ def main() -> None:
 
     st.divider()
     st.subheader("Chat with this PDF")
+    search_full_document = st.toggle(
+        "Search whole document",
+        value=False,
+        help="Use this for broad questions that need every chunk. Broad prompts are also detected automatically. It is slower, but it reads the PDF in batches instead of only retrieving the nearest chunks.",
+    )
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
@@ -473,21 +600,38 @@ def main() -> None:
 
     try:
         with st.chat_message("assistant"):
-            with st.spinner("Searching the PDF..."):
-                context, sources = retrieve_context(vector_store, question, retrieval_k, max_context_chars)
-
             answer_box = st.empty()
             answer_parts = []
-            prompt = build_qa_prompt(question, context)
-            logger.info("Starting answer with provider=%s model=%s", provider, model_name)
             generation_start = time.perf_counter()
-            for token in stream_llm_text(llm, prompt):
-                answer_parts.append(token)
-                answer_box.markdown("".join(answer_parts))
-            answer = "".join(answer_parts)
-            logger.info("Answer finished in %.2fs with %s characters", time.perf_counter() - generation_start, len(answer))
+            exhaustive_search = search_full_document or should_search_full_document(question)
 
-            if sources:
+            if exhaustive_search:
+                with st.spinner("Reading the whole PDF in batches..."):
+                    answer, batches = answer_from_full_document(llm, question, docs, exhaustive_batch_chars)
+                answer_box.markdown(answer)
+                logger.info(
+                    "Full-document answer finished in %.2fs with %s batches and %s characters",
+                    time.perf_counter() - generation_start,
+                    len(batches),
+                    len(answer),
+                )
+                with st.expander("Document batches scanned"):
+                    st.caption(f"Scanned {len(docs)} chunks in {len(batches)} context-window-sized batches.")
+                    for batch_number, batch in enumerate(batches, start=1):
+                        st.caption(f"Batch {batch_number}")
+                        st.write(batch[:1200])
+            else:
+                with st.spinner("Searching the PDF..."):
+                    context, sources = retrieve_context(vector_store, question, retrieval_k, max_context_chars)
+
+                prompt = build_qa_prompt(question, context)
+                logger.info("Starting answer with provider=%s model=%s", provider, model_name)
+                for token in stream_llm_text(llm, prompt):
+                    answer_parts.append(token)
+                    answer_box.markdown("".join(answer_parts))
+                answer = "".join(answer_parts)
+                logger.info("Answer finished in %.2fs with %s characters", time.perf_counter() - generation_start, len(answer))
+
                 with st.expander("Retrieved context"):
                     for source in sources:
                         chunk = source.metadata.get("chunk", "?")

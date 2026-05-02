@@ -34,6 +34,7 @@ set CHUNK_SIZE=1800
 set CHUNK_OVERLAP=150
 set SUMMARY_CHUNKS=16
 set SUMMARY_MAX_CHARS=24000
+set EXHAUSTIVE_BATCH_CHARS=5000
 ```
 
 For local Qwen-style models through Ollama:
@@ -55,7 +56,7 @@ Then open the local URL Streamlit prints in your terminal.
 ## Notes
 
 - Chroma stores local indexes in `.chroma/`.
-- Chat uses direct Chroma similarity search plus one streamed LLM answer for lower latency.
+- Chat uses direct Chroma similarity search plus one streamed LLM answer for lower latency. Turn on **Search whole document** in the app for broad questions that need every chunk; it scans the PDF in context-window-sized batches and merges the notes into a final answer.
 - `BAAI/bge-small-en-v1.5` through FastEmbed is the default because it is much faster on laptop CPUs. Use `BAAI/bge-m3` with `EMBEDDING_BACKEND=sentence-transformers` only when you need higher retrieval quality and can accept slower query embedding.
 - For 30 to 90 page PDFs, indexing will take longer on first upload, but Chroma reuses the saved index on later runs for the same PDF, embedding model, and chunk settings.
 - Scanned PDFs need OCR first because PyPDF2 only extracts embedded text.
