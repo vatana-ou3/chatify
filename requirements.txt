@@ -7,6 +7,7 @@ langchain-openai>=0.3,<0.4
 langchain-huggingface>=0.3,<0.4
 langchain-ollama>=0.3,<0.4
 chromadb>=1.0,<2
+protobuf>=3.20.3,<4
 sentence-transformers>=3.0,<6
 fastembed>=0.4,<1
 PyPDF2>=3.0,<4
