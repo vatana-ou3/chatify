@@ -67,9 +67,11 @@ LLM_PROVIDER = "OpenAI"
 OPENAI_MODEL = "gpt-4o-mini"
 EMBEDDING_BACKEND = "openai"
 OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
-MAX_OUTPUT_TOKENS = "1200"
-MAX_CONTEXT_CHARS = "5000"
-EXHAUSTIVE_BATCH_CHARS = "5000"
+MAX_OUTPUT_TOKENS = "800"
+MAX_CONTEXT_CHARS = "4000"
+EXHAUSTIVE_BATCH_CHARS = "4000"
+SUMMARY_CHUNKS = "8"
+SUMMARY_MAX_CHARS = "12000"
 ```
 
 Do not upload `.env`, `.chroma/`, `.fastembed_cache/`, or `.venv/` to GitHub. They are already ignored by `.gitignore`.
@@ -80,6 +82,7 @@ Do not upload `.env`, `.chroma/`, `.fastembed_cache/`, or `.venv/` to GitHub. Th
 - Hosted mode should use `EMBEDDING_BACKEND=openai` so the server does not need local embedding model files.
 - Chat uses direct Chroma similarity search plus one streamed LLM answer for lower latency. Turn on **Search whole document** in the app for broad questions that need every chunk; it scans the PDF in context-window-sized batches and merges the notes into a final answer.
 - The Quiz tab can generate QCM/multiple-choice, context/open, or mixed quizzes from the uploaded PDF. You can choose the number of questions and set easy, medium, hard, or mixed difficulty.
+- Summaries are generated on demand so uploaded documents become usable faster, especially on mobile.
 - `BAAI/bge-small-en-v1.5` through FastEmbed is the default because it is much faster on laptop CPUs. Use `BAAI/bge-m3` with `EMBEDDING_BACKEND=sentence-transformers` only when you need higher retrieval quality and can accept slower query embedding.
 - For 30 to 90 page PDFs, indexing will take longer on first upload, but Chroma reuses the saved index on later runs for the same PDF, embedding model, and chunk settings.
 - Scanned PDFs need OCR first because PyPDF2 only extracts embedded text.

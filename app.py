@@ -746,7 +746,9 @@ def main() -> None:
 
     with col_summary:
         st.subheader("Summary")
-        if not st.session_state.summary:
+        if st.session_state.summary:
+            st.markdown(st.session_state.summary)
+        elif st.button("Generate summary", use_container_width=True):
             try:
                 logger.info("Starting summary with provider=%s model=%s", provider, model_name)
                 prompt = build_summary_prompt(docs, summary_chunks, summary_max_chars)
@@ -762,7 +764,7 @@ def main() -> None:
                 logger.exception("Summary failed")
                 st.error(f"Summary failed: {exc}")
         else:
-            st.markdown(st.session_state.summary)
+            st.info("Generate the summary only when you need it. Chat and quiz are ready below.")
 
     st.divider()
     chat_tab, quiz_tab = st.tabs(["Chat", "Quiz"])
