@@ -17,11 +17,12 @@ from langchain_core.prompts import PromptTemplate
 
 
 APP_TITLE = "Chatify"
-DEFAULT_EMBEDDING_BACKEND = "fastembed"
-DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+DEFAULT_EMBEDDING_BACKEND = "sentence-transformers"
+DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_OLLAMA_MODEL = "frob/qwen3.5-instruct:4b"  # Change this to your Ollama model name if different
-DEFAULT_LLM_PROVIDER = "Ollama"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_LLM_PROVIDER = "Gemini"
 DEFAULT_TEMPERATURE = 0.1
 DEFAULT_MAX_OUTPUT_TOKENS = 1200
 DEFAULT_RETRIEVAL_K = 3
@@ -237,6 +238,16 @@ def get_llm(provider: str, model_name: str, temperature: float, api_key: str | N
             temperature=temperature,
             max_tokens=max_output_tokens,
             api_key=api_key or get_secret("OPENAI_API_KEY"),
+        )
+
+    if provider == "Gemini":
+        from langchain_google_genai import ChatGoogleGenerativeAI
+
+        return ChatGoogleGenerativeAI(
+            model=model_name,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+            google_api_key=api_key or get_secret("GEMINI_API_KEY") or get_secret("GOOGLE_API_KEY"),
         )
 
     if provider == "Hugging Face":
@@ -601,6 +612,10 @@ def get_app_config():
         provider = "OpenAI"
         model_name = get_config_value("OPENAI_MODEL", "gpt-4o-mini")
         api_key = get_secret("OPENAI_API_KEY")
+    elif provider_key in {"gemini", "google", "google ai", "google generative ai"}:
+        provider = "Gemini"
+        model_name = get_config_value("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+        api_key = get_secret("GEMINI_API_KEY") or get_secret("GOOGLE_API_KEY")
     elif provider_key in {"hugging face", "huggingface"}:
         provider = "Hugging Face"
         model_name = get_config_value("HUGGINGFACE_MODEL", "Qwen/Qwen2.5-7B-Instruct")

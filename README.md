@@ -7,9 +7,9 @@ A Streamlit chatbot that lets a user upload a PDF, generate an explanatory guide
 - Streamlit for the UI
 - LangChain for orchestration
 - PyPDF2 for PDF text extraction
-- FastEmbed for low-latency local CPU embeddings
+- Sentence Transformers for local CPU embeddings
 - ChromaDB for local vector storage
-- Ollama, OpenAI, or Hugging Face Hub for the chat model
+- Gemini, Ollama, OpenAI, or Hugging Face Hub for the chat model
 
 ## Setup
 
@@ -23,11 +23,13 @@ Optional API keys and app configuration can be provided through a `.env` file:
 
 ```bash
 set OPENAI_API_KEY=your_openai_key
+set GEMINI_API_KEY=your_gemini_key
 set HUGGINGFACEHUB_API_TOKEN=your_hugging_face_token
-set LLM_PROVIDER=Ollama
+set LLM_PROVIDER=Gemini
+set GEMINI_MODEL=gemini-2.5-flash
 set OLLAMA_MODEL=frob/qwen3.5-instruct:4b
-set EMBEDDING_BACKEND=fastembed
-set EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
+set EMBEDDING_BACKEND=sentence-transformers
+set EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
 set OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 set MAX_OUTPUT_TOKENS=1200
 set RETRIEVAL_K=3
@@ -38,6 +40,8 @@ set SUMMARY_CHUNKS=16
 set SUMMARY_MAX_CHARS=24000
 set EXHAUSTIVE_BATCH_CHARS=5000
 ```
+
+For Gemini, create an API key in Google AI Studio, put it in `GEMINI_API_KEY`, and keep `GEMINI_MODEL=gemini-2.5-flash`.
 
 For local Qwen-style models through Ollama:
 
@@ -57,16 +61,16 @@ Then open the local URL Streamlit prints in your terminal.
 
 ## Hosting
 
-For a hosted version, use OpenAI for both the chat model and embeddings. Keep Chroma as temporary local storage on the app server; uploaded PDFs will be indexed again if the host restarts.
+For a hosted version, use Gemini for the chat model and a local sentence-transformers model for embeddings. Keep Chroma as temporary local storage on the app server; uploaded PDFs will be indexed again if the host restarts.
 
 For Streamlit Community Cloud, push this repo to GitHub, deploy `app.py`, then add these secrets in the app settings:
 
 ```toml
-OPENAI_API_KEY = "your_openai_key"
-LLM_PROVIDER = "OpenAI"
-OPENAI_MODEL = "gpt-4o-mini"
-EMBEDDING_BACKEND = "openai"
-OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
+GEMINI_API_KEY = "your_gemini_key"
+LLM_PROVIDER = "Gemini"
+GEMINI_MODEL = "gemini-2.5-flash"
+EMBEDDING_BACKEND = "sentence-transformers"
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 MAX_OUTPUT_TOKENS = "800"
 MAX_CONTEXT_CHARS = "4000"
 EXHAUSTIVE_BATCH_CHARS = "4000"
@@ -79,11 +83,11 @@ Do not upload `.env`, `.chroma/`, `.fastembed_cache/`, or `.venv/` to GitHub. Th
 ## Notes
 
 - Chroma stores local indexes in `.chroma/`.
-- Hosted mode should use `EMBEDDING_BACKEND=openai` so the server does not need local embedding model files.
+- Hosted mode can use `EMBEDDING_BACKEND=sentence-transformers`, but the first run may download the embedding model and use more RAM than API embeddings.
 - Chat uses direct Chroma similarity search plus one streamed LLM answer for lower latency. Turn on **Search whole document** in the app for broad questions that need every chunk; it scans the PDF in context-window-sized batches and merges the notes into a final answer.
 - The Quiz tab can generate QCM/multiple-choice, context/open, or mixed quizzes from the uploaded PDF. You can choose the number of questions and set easy, medium, hard, or mixed difficulty.
 - Summaries are generated on demand so uploaded documents become usable faster, especially on mobile.
-- `BAAI/bge-small-en-v1.5` through FastEmbed is the default because it is much faster on laptop CPUs. Use `BAAI/bge-m3` with `EMBEDDING_BACKEND=sentence-transformers` only when you need higher retrieval quality and can accept slower query embedding.
+- `sentence-transformers/all-MiniLM-L6-v2` is the default because it is small, free, and works well on laptop CPUs. Use `BAAI/bge-m3` only when you need higher retrieval quality and can accept slower query embedding.
 - For 30 to 90 page PDFs, indexing will take longer on first upload, but Chroma reuses the saved index on later runs for the same PDF, embedding model, and chunk settings.
 - Scanned PDFs need OCR first because PyPDF2 only extracts embedded text.
 - The generated explanation samples chunks from across the document so later pages are represented. For very large PDFs, increase `SUMMARY_CHUNKS` or move the explanation step to a background map-reduce job.
