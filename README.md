@@ -1,6 +1,6 @@
 # PDF Chatify
 
-A Streamlit chatbot that lets a user upload a PDF, generate an explanatory guide, and ask questions grounded in the document.
+A Streamlit chatbot that lets a user upload a PDF, automatically generate an explanatory guide, and ask questions grounded in the document.
 
 ## Stack
 
@@ -33,11 +33,11 @@ set EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
 set OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 set MAX_OUTPUT_TOKENS=1200
 set RETRIEVAL_K=3
-set MAX_CONTEXT_CHARS=5000
+set MAX_CONTEXT_CHARS=50000
 set CHUNK_SIZE=1800
 set CHUNK_OVERLAP=150
-set SUMMARY_CHUNKS=16
-set SUMMARY_MAX_CHARS=24000
+set SUMMARY_CHUNKS=0
+set SUMMARY_MAX_CHARS=750000
 set EXHAUSTIVE_BATCH_CHARS=5000
 ```
 
@@ -72,10 +72,10 @@ GEMINI_MODEL = "gemini-2.5-flash"
 EMBEDDING_BACKEND = "sentence-transformers"
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 MAX_OUTPUT_TOKENS = "800"
-MAX_CONTEXT_CHARS = "4000"
+MAX_CONTEXT_CHARS = "50000"
 EXHAUSTIVE_BATCH_CHARS = "4000"
-SUMMARY_CHUNKS = "8"
-SUMMARY_MAX_CHARS = "12000"
+SUMMARY_CHUNKS = "0"
+SUMMARY_MAX_CHARS = "750000"
 ```
 
 Do not upload `.env`, `.chroma/`, `.fastembed_cache/`, or `.venv/` to GitHub. They are already ignored by `.gitignore`.
@@ -86,7 +86,8 @@ Do not upload `.env`, `.chroma/`, `.fastembed_cache/`, or `.venv/` to GitHub. Th
 - Hosted mode can use `EMBEDDING_BACKEND=sentence-transformers`, but the first run may download the embedding model and use more RAM than API embeddings.
 - Chat uses direct Chroma similarity search plus one streamed LLM answer for lower latency. Turn on **Search whole document** in the app for broad questions that need every chunk; it scans the PDF in context-window-sized batches and merges the notes into a final answer.
 - The Quiz tab can generate QCM/multiple-choice, context/open, or mixed quizzes from the uploaded PDF. You can choose the number of questions and set easy, medium, hard, or mixed difficulty.
-- Summaries are generated on demand so uploaded documents become usable faster, especially on mobile.
+- Summaries are generated automatically after upload and indexing.
+- `SUMMARY_CHUNKS=0` makes summaries use every extracted chunk. `SUMMARY_MAX_CHARS=750000` fits much more of a PDF when using Gemini's long context; lower it only if hosting memory or latency becomes a problem.
 - `sentence-transformers/all-MiniLM-L6-v2` is the default because it is small, free, and works well on laptop CPUs. Use `BAAI/bge-m3` only when you need higher retrieval quality and can accept slower query embedding.
 - For 30 to 90 page PDFs, indexing will take longer on first upload, but Chroma reuses the saved index on later runs for the same PDF, embedding model, and chunk settings.
 - Scanned PDFs need OCR first because PyPDF2 only extracts embedded text.

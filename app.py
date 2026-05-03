@@ -26,11 +26,11 @@ DEFAULT_LLM_PROVIDER = "Gemini"
 DEFAULT_TEMPERATURE = 0.1
 DEFAULT_MAX_OUTPUT_TOKENS = 1200
 DEFAULT_RETRIEVAL_K = 3
-DEFAULT_MAX_CONTEXT_CHARS = 5000
+DEFAULT_MAX_CONTEXT_CHARS = 50000
 DEFAULT_CHUNK_SIZE = 1800
 DEFAULT_CHUNK_OVERLAP = 150
-DEFAULT_SUMMARY_CHUNKS = 16
-DEFAULT_SUMMARY_MAX_CHARS = 24000
+DEFAULT_SUMMARY_CHUNKS = 0
+DEFAULT_SUMMARY_MAX_CHARS = 750000
 DEFAULT_EXHAUSTIVE_BATCH_CHARS = 5000
 DEFAULT_QUIZ_QUESTION_COUNT = 5
 CHROMA_DIR = ".chroma"
@@ -89,6 +89,7 @@ def reset_chat() -> None:
     st.session_state.messages = []
     st.session_state.chat_history = []
     st.session_state.summary = ""
+    st.session_state.summary_key = ""
     st.session_state.quiz = ""
     st.session_state.quiz_batch_count = 0
     st.session_state.active_file_hash = ""
@@ -405,6 +406,9 @@ Quiz:"""
 
 
 def select_summary_docs(docs: list[Document], summary_chunks: int) -> list[Document]:
+    if summary_chunks <= 0:
+        return docs
+
     if len(docs) <= summary_chunks:
         return docs
 
@@ -418,7 +422,8 @@ def select_summary_docs(docs: list[Document], summary_chunks: int) -> list[Docum
 def build_summary_prompt(docs: Iterable[Document], summary_chunks: int, summary_max_chars: int) -> str:
     selected_docs = select_summary_docs(list(docs), summary_chunks)
     context = "\n\n".join(doc.page_content for doc in selected_docs)
-    context = context[:summary_max_chars]
+    if summary_max_chars > 0:
+        context = context[:summary_max_chars]
     return SUMMARY_PROMPT.format(context=context)
 
 
@@ -647,6 +652,7 @@ def ensure_session_defaults() -> None:
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("chat_history", [])
     st.session_state.setdefault("summary", "")
+    st.session_state.setdefault("summary_key", "")
     st.session_state.setdefault("quiz", "")
     st.session_state.setdefault("quiz_batch_count", 0)
     st.session_state.setdefault("active_file_hash", "")
@@ -730,6 +736,7 @@ def main() -> None:
         st.session_state.messages = []
         st.session_state.chat_history = []
         st.session_state.summary = ""
+        st.session_state.summary_key = ""
         st.session_state.quiz = ""
         st.session_state.quiz_batch_count = 0
         st.session_state.active_file_hash = payload.file_hash
@@ -764,9 +771,10 @@ def main() -> None:
 
     with col_summary:
         st.subheader("Summary")
-        if st.session_state.summary:
+        summary_key = f"{payload.file_hash}:{provider}:{model_name}:{summary_chunks}:{summary_max_chars}:{chunk_size}:{chunk_overlap}"
+        if st.session_state.summary and st.session_state.summary_key == summary_key:
             st.markdown(st.session_state.summary)
-        elif st.button("Generate summary", use_container_width=True):
+        else:
             try:
                 logger.info("Starting summary with provider=%s model=%s", provider, model_name)
                 prompt = build_summary_prompt(docs, summary_chunks, summary_max_chars)
@@ -777,12 +785,11 @@ def main() -> None:
                         summary_parts.append(token)
                         summary_box.markdown("".join(summary_parts))
                 st.session_state.summary = "".join(summary_parts)
+                st.session_state.summary_key = summary_key
                 logger.info("Summary finished with %s characters", len(st.session_state.summary))
             except Exception as exc:
                 logger.exception("Summary failed")
                 st.error(f"Summary failed: {exc}")
-        else:
-            st.info("Generate the summary only when you need it. Chat and quiz are ready below.")
 
     st.divider()
     chat_tab, quiz_tab = st.tabs(["Chat", "Quiz"])
