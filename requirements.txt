@@ -13,3 +13,6 @@ sentence-transformers>=3.0,<6
 fastembed>=0.4,<1
 PyPDF2>=3.0,<4
 python-dotenv>=1.0,<2
+youtube-transcript-api>=1.2,<2
+yt-dlp>=2025.12.30
+faster-whisper>=1.1,<2

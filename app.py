@@ -1,10 +1,12 @@
 import hashlib
 import logging
 import os
+import re
 import tempfile
 import time
 from dataclasses import dataclass
 from typing import Iterable
+from urllib.parse import parse_qs, urlparse
 
 import streamlit as st
 from PyPDF2 import PdfReader
@@ -33,6 +35,9 @@ DEFAULT_SUMMARY_CHUNKS = 0
 DEFAULT_SUMMARY_MAX_CHARS = 750000
 DEFAULT_EXHAUSTIVE_BATCH_CHARS = 5000
 DEFAULT_QUIZ_QUESTION_COUNT = 5
+DEFAULT_YOUTUBE_LANGUAGES = "en"
+DEFAULT_YOUTUBE_WHISPER_MODEL = "base"
+DEFAULT_YOUTUBE_MAX_WHISPER_MINUTES = 90
 CHROMA_DIR = ".chroma"
 FASTEMBED_CACHE_DIR = ".fastembed_cache"
 EMBEDDING_MODEL_ALIASES = {
@@ -48,11 +53,15 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class PdfPayload:
+class SourcePayload:
     file_hash: str
-    file_name: str
+    source_name: str
+    source_type: str
     text: str
-    page_count: int
+    item_count: int
+    url: str = ""
+    duration_seconds: int | None = None
+    transcript_source: str = ""
 
 
 def get_secret(name: str) -> str | None:
@@ -74,11 +83,11 @@ def get_config_value(name: str, default: str | None = None) -> str | None:
 
 def init_page() -> None:
     load_dotenv()
-    st.set_page_config(page_title=APP_TITLE, page_icon="PDF", layout="wide")
+    st.set_page_config(page_title=APP_TITLE, page_icon="CHAT", layout="wide")
     title_col, action_col = st.columns([1, 0.18])
     with title_col:
         st.title(APP_TITLE)
-        st.caption("Upload a PDF, get a concise summary, then ask questions grounded in the document.")
+        st.caption("Add a PDF or YouTube video, get a concise summary, then ask questions grounded in the source.")
     with action_col:
         if st.button("New chat", use_container_width=True):
             reset_chat()
@@ -96,9 +105,10 @@ def reset_chat() -> None:
     st.session_state.active_index_key = ""
     st.session_state.vector_store = None
     st.session_state.uploader_key = st.session_state.get("uploader_key", 0) + 1
+    st.session_state.youtube_url = ""
 
 
-def read_pdf(uploaded_file) -> PdfPayload:
+def read_pdf(uploaded_file) -> SourcePayload:
     file_bytes = uploaded_file.getvalue()
     file_hash = hashlib.sha256(file_bytes).hexdigest()[:16]
 
@@ -116,15 +126,212 @@ def read_pdf(uploaded_file) -> PdfPayload:
     finally:
         os.unlink(tmp_path)
 
-    return PdfPayload(
+    return SourcePayload(
         file_hash=file_hash,
-        file_name=uploaded_file.name,
+        source_name=uploaded_file.name,
+        source_type="pdf",
         text="\n".join(pages).strip(),
-        page_count=len(reader.pages),
+        item_count=len(reader.pages),
     )
 
 
-def split_pdf(payload: PdfPayload, chunk_size: int, chunk_overlap: int) -> list[Document]:
+def parse_youtube_video_id(url: str) -> str:
+    parsed = urlparse(url.strip())
+    host = parsed.netloc.lower().removeprefix("www.")
+
+    if host == "youtu.be":
+        video_id = parsed.path.strip("/").split("/")[0]
+    elif host in {"youtube.com", "m.youtube.com", "music.youtube.com"}:
+        if parsed.path == "/watch":
+            video_id = parse_qs(parsed.query).get("v", [""])[0]
+        elif parsed.path.startswith(("/shorts/", "/embed/")):
+            parts = parsed.path.strip("/").split("/")
+            video_id = parts[1] if len(parts) > 1 else ""
+        else:
+            video_id = ""
+    else:
+        video_id = ""
+
+    if not re.fullmatch(r"[\w-]{11}", video_id):
+        raise ValueError("Please enter a valid YouTube video URL.")
+    return video_id
+
+
+def format_timestamp(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def segment_value(segment, name: str, default=0):
+    if isinstance(segment, dict):
+        return segment.get(name, default)
+    return getattr(segment, name, default)
+
+
+def fetch_youtube_captions(video_id: str, languages: list[str]) -> tuple[str, int]:
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+    except ImportError as exc:
+        raise RuntimeError("Install youtube-transcript-api to fetch YouTube captions.") from exc
+
+    transcript = YouTubeTranscriptApi().fetch(video_id, languages=languages)
+    lines = []
+    last_end = 0
+    for segment in transcript:
+        start = float(segment_value(segment, "start", 0) or 0)
+        duration = float(segment_value(segment, "duration", 0) or 0)
+        text = str(segment_value(segment, "text", "")).replace("\n", " ").strip()
+        if not text:
+            continue
+        last_end = max(last_end, int(start + duration))
+        lines.append(f"[{format_timestamp(start)}] {text}")
+
+    return "\n".join(lines), last_end
+
+
+def fetch_youtube_info(url: str) -> dict:
+    try:
+        import yt_dlp
+    except ImportError as exc:
+        raise RuntimeError("Install yt-dlp to inspect YouTube video metadata or use Whisper fallback.") from exc
+
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def download_youtube_audio(url: str, output_dir: str) -> str:
+    try:
+        import yt_dlp
+    except ImportError as exc:
+        raise RuntimeError("Install yt-dlp to download YouTube audio for Whisper transcription.") from exc
+
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(output_dir, "audio.%(ext)s"),
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "64",
+            }
+        ],
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.extract_info(url, download=True)
+
+    audio_files = [
+        os.path.join(output_dir, file_name)
+        for file_name in os.listdir(output_dir)
+        if file_name.lower().endswith((".mp3", ".m4a", ".webm", ".opus", ".wav"))
+    ]
+    if not audio_files:
+        raise RuntimeError("Audio download finished, but no audio file was found. Make sure ffmpeg is installed.")
+    return audio_files[0]
+
+
+def transcribe_audio_with_whisper(audio_path: str, model_name: str) -> str:
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        raise RuntimeError("Install faster-whisper to transcribe videos without captions.") from exc
+
+    model = WhisperModel(model_name, device="cpu", compute_type="int8")
+    segments, _ = model.transcribe(audio_path, vad_filter=True)
+    lines = []
+    for segment in segments:
+        text = segment.text.replace("\n", " ").strip()
+        if text:
+            lines.append(f"[{format_timestamp(segment.start)}] {text}")
+    return "\n".join(lines)
+
+
+def read_youtube(
+    url: str,
+    languages: list[str],
+    allow_whisper: bool,
+    whisper_model: str,
+    max_whisper_minutes: int,
+) -> SourcePayload:
+    video_id = parse_youtube_video_id(url)
+    source_url = f"https://www.youtube.com/watch?v={video_id}"
+    info = None
+    title = f"YouTube video {video_id}"
+    duration = None
+
+    try:
+        info = fetch_youtube_info(source_url)
+        title = info.get("title") or title
+        duration = info.get("duration")
+    except Exception as exc:
+        logger.info("Could not fetch YouTube metadata before captions: %s", exc)
+
+    try:
+        text, caption_duration = fetch_youtube_captions(video_id, languages)
+        if text.strip():
+            duration = duration or caption_duration
+            file_hash = hashlib.sha256(f"youtube:{video_id}:{text}".encode("utf-8")).hexdigest()[:16]
+            return SourcePayload(
+                file_hash=file_hash,
+                source_name=title,
+                source_type="youtube",
+                text=text,
+                item_count=len(text.splitlines()),
+                url=source_url,
+                duration_seconds=int(duration) if duration else caption_duration,
+                transcript_source="YouTube captions",
+            )
+    except Exception as exc:
+        logger.info("YouTube captions unavailable for %s: %s", video_id, exc)
+        if not allow_whisper:
+            raise RuntimeError(
+                "No usable YouTube captions were found. Enable Whisper fallback to transcribe the audio."
+            ) from exc
+
+    if info is None:
+        info = fetch_youtube_info(source_url)
+        title = info.get("title") or title
+        duration = info.get("duration")
+
+    max_seconds = max_whisper_minutes * 60
+    if duration and duration > max_seconds:
+        raise RuntimeError(
+            f"This video is {round(duration / 60)} minutes long. Whisper fallback is capped at {max_whisper_minutes} minutes."
+        )
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        audio_path = download_youtube_audio(source_url, tmp_dir)
+        text = transcribe_audio_with_whisper(audio_path, whisper_model)
+
+    if not text.strip():
+        raise RuntimeError("Whisper did not produce transcript text for this video.")
+
+    file_hash = hashlib.sha256(f"youtube:{video_id}:whisper:{text}".encode("utf-8")).hexdigest()[:16]
+    return SourcePayload(
+        file_hash=file_hash,
+        source_name=title,
+        source_type="youtube",
+        text=text,
+        item_count=len(text.splitlines()),
+        url=source_url,
+        duration_seconds=int(duration) if duration else None,
+        transcript_source=f"Whisper ({whisper_model})",
+    )
+
+
+def split_source(payload: SourcePayload, chunk_size: int, chunk_overlap: int) -> list[Document]:
     start = time.perf_counter()
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
@@ -136,7 +343,9 @@ def split_pdf(payload: PdfPayload, chunk_size: int, chunk_overlap: int) -> list[
         Document(
             page_content=chunk,
             metadata={
-                "source": payload.file_name,
+                "source": payload.source_name,
+                "source_type": payload.source_type,
+                "url": payload.url,
                 "file_hash": payload.file_hash,
                 "chunk": index,
             },
@@ -144,8 +353,9 @@ def split_pdf(payload: PdfPayload, chunk_size: int, chunk_overlap: int) -> list[
         for index, chunk in enumerate(chunks)
     ]
     logger.info(
-        "Split %s pages into %s chunks in %.2fs using chunk_size=%s chunk_overlap=%s",
-        payload.page_count,
+        "Split %s %s items into %s chunks in %.2fs using chunk_size=%s chunk_overlap=%s",
+        payload.item_count,
+        payload.source_type,
         len(docs),
         time.perf_counter() - start,
         chunk_size,
@@ -196,10 +406,10 @@ def get_embeddings(backend: str, model_name: str):
     return embeddings
 
 
-def build_vector_store(file_hash: str, embedding_backend: str, embedding_model: str, docs: list[Document]):
+def build_vector_store(source_type: str, file_hash: str, embedding_backend: str, embedding_model: str, docs: list[Document]):
     embeddings = get_embeddings(embedding_backend, embedding_model)
     embedding_hash = hashlib.sha256(f"{embedding_backend}:{embedding_model}".encode("utf-8")).hexdigest()[:8]
-    collection_name = f"pdf_{file_hash}_{embedding_hash}"
+    collection_name = f"{source_type}_{file_hash}_{embedding_hash}"
     vector_store = Chroma(
         collection_name=collection_name,
         embedding_function=embeddings,
@@ -218,7 +428,7 @@ def build_vector_store(file_hash: str, embedding_backend: str, embedding_model: 
         embedding_model,
     )
     start = time.perf_counter()
-    ids = [f"{file_hash}-{doc.metadata['chunk']}" for doc in docs]
+    ids = [f"{source_type}-{file_hash}-{doc.metadata['chunk']}" for doc in docs]
     vector_store = Chroma.from_documents(
         documents=docs,
         embedding=embeddings,
@@ -268,27 +478,28 @@ def get_llm(provider: str, model_name: str, temperature: float, api_key: str | N
 
 
 SUMMARY_PROMPT = PromptTemplate.from_template(
-    """You are explaining a PDF for a reader. /no_think
+    """You are explaining a {source_type} for a reader. /no_think
 
-Write an explanatory guide using only the document content below.
+Write a useful summary using only the source content below.
 Do not include hidden reasoning, chain-of-thought, or <think> text.
-Do not only say what the document is about. Explain the actual content so a reader can understand it without reading the PDF.
+Do not only say what the source is about. Explain the actual content so a reader can understand it without reading or watching the original.
+Adapt the depth to the source length. For short videos, keep it compact and do not inflate simple material.
 
 Use this structure:
 
-## Plain-language explanation
-Explain the document's ideas step by step. Define important terms, explain why each idea matters, and connect related points.
+## Quick summary
+Explain the main message in plain language.
 
-## Key details from the document
+## Key details
 List the important facts, examples, tools, commands, names, dates, numbers, warnings, or procedures that appear in the content.
 
-## What the reader should understand
-Explain the main takeaways and how the pieces fit together.
+## Takeaways
+Explain what the reader should remember.
 
-## Good follow-up questions
-Suggest questions the reader can ask to understand unclear or advanced parts.
+## Useful questions
+Suggest a few questions the reader can ask next.
 
-Document content:
+Source content:
 {context}
 
 Summary:"""
@@ -296,8 +507,8 @@ Summary:"""
 
 
 QA_PROMPT = PromptTemplate.from_template(
-    """You answer questions about one uploaded PDF. /no_think
-Use only the context below. If the answer is not in the PDF, say that the document does not contain enough information.
+    """You answer questions about one uploaded source. /no_think
+Use only the context below. If the answer is not in the source, say that the source does not contain enough information.
 Do not include hidden reasoning, chain-of-thought, or <think> text.
 Keep the answer concise and practical.
 
@@ -311,7 +522,7 @@ Answer:"""
 
 
 EXHAUSTIVE_BATCH_PROMPT = PromptTemplate.from_template(
-    """You answer questions about one uploaded PDF. /no_think
+    """You answer questions about one uploaded source. /no_think
 Use only the document section below.
 Do not include hidden reasoning, chain-of-thought, or <think> text.
 
@@ -328,11 +539,11 @@ Section notes:"""
 
 
 EXHAUSTIVE_FINAL_PROMPT = PromptTemplate.from_template(
-    """You answer questions about one uploaded PDF. /no_think
-Use only the notes below. These notes were produced by reading the PDF in sections, so they may cover different parts of the document.
+    """You answer questions about one uploaded source. /no_think
+Use only the notes below. These notes were produced by reading the source in sections, so they may cover different parts of the document.
 Do not include hidden reasoning, chain-of-thought, or <think> text.
 Keep the answer practical and mention when different sections add different details.
-If the notes do not contain enough information, say that the document does not contain enough information.
+If the notes do not contain enough information, say that the source does not contain enough information.
 
 Question: {question}
 
@@ -363,7 +574,7 @@ Quiz material:"""
 
 
 QUIZ_FINAL_PROMPT = PromptTemplate.from_template(
-    """Create a quiz from one uploaded PDF. /no_think
+    """Create a quiz from one uploaded source. /no_think
 Use only the document material below.
 Do not include hidden reasoning, chain-of-thought, or <think> text.
 
@@ -424,7 +635,14 @@ def build_summary_prompt(docs: Iterable[Document], summary_chunks: int, summary_
     context = "\n\n".join(doc.page_content for doc in selected_docs)
     if summary_max_chars > 0:
         context = context[:summary_max_chars]
-    return SUMMARY_PROMPT.format(context=context)
+    source_type = "source"
+    if selected_docs:
+        source_type = selected_docs[0].metadata.get("source_type", "source")
+        if source_type == "youtube":
+            source_type = "YouTube video transcript"
+        elif source_type == "pdf":
+            source_type = "PDF"
+    return SUMMARY_PROMPT.format(source_type=source_type, context=context)
 
 
 def stream_llm_text(llm, prompt: str):
@@ -611,6 +829,11 @@ def get_app_config():
     summary_chunks = int(get_config_value("SUMMARY_CHUNKS", str(DEFAULT_SUMMARY_CHUNKS)))
     summary_max_chars = int(get_config_value("SUMMARY_MAX_CHARS", str(DEFAULT_SUMMARY_MAX_CHARS)))
     exhaustive_batch_chars = int(get_config_value("EXHAUSTIVE_BATCH_CHARS", str(DEFAULT_EXHAUSTIVE_BATCH_CHARS)))
+    youtube_languages = get_config_value("YOUTUBE_TRANSCRIPT_LANGUAGES", DEFAULT_YOUTUBE_LANGUAGES)
+    youtube_whisper_model = get_config_value("YOUTUBE_WHISPER_MODEL", DEFAULT_YOUTUBE_WHISPER_MODEL)
+    youtube_max_whisper_minutes = int(
+        get_config_value("YOUTUBE_MAX_WHISPER_MINUTES", str(DEFAULT_YOUTUBE_MAX_WHISPER_MINUTES))
+    )
 
     provider_key = provider.lower()
     if provider_key == "openai":
@@ -645,6 +868,9 @@ def get_app_config():
         summary_chunks,
         summary_max_chars,
         exhaustive_batch_chars,
+        youtube_languages,
+        youtube_whisper_model,
+        youtube_max_whisper_minutes,
     )
 
 
@@ -659,6 +885,7 @@ def ensure_session_defaults() -> None:
     st.session_state.setdefault("active_index_key", "")
     st.session_state.setdefault("vector_store", None)
     st.session_state.setdefault("uploader_key", 0)
+    st.session_state.setdefault("youtube_url", "")
 
 
 def render_quiz_controls(max_output_tokens: int) -> tuple[str, str, int]:
@@ -712,25 +939,60 @@ def main() -> None:
         summary_chunks,
         summary_max_chars,
         exhaustive_batch_chars,
+        youtube_languages,
+        youtube_whisper_model,
+        youtube_max_whisper_minutes,
     ) = get_app_config()
-    uploaded_file = st.file_uploader(
-        "Drop your PDF here",
-        type=["pdf"],
-        accept_multiple_files=False,
-        help="Drag and drop a PDF file here, or click Browse files.",
-        key=f"pdf_uploader_{st.session_state.uploader_key}",
-    )
+    source_type = st.radio("Source", ["PDF", "YouTube"], horizontal=True)
 
-    if not uploaded_file:
-        st.info("Drop a PDF file above to generate a summary and start chatting with it.")
-        return
+    payload = None
+    if source_type == "PDF":
+        uploaded_file = st.file_uploader(
+            "Drop your PDF here",
+            type=["pdf"],
+            accept_multiple_files=False,
+            help="Drag and drop a PDF file here, or click Browse files.",
+            key=f"pdf_uploader_{st.session_state.uploader_key}",
+        )
 
-    with st.spinner("Reading PDF..."):
-        payload = read_pdf(uploaded_file)
+        if not uploaded_file:
+            st.info("Drop a PDF file above to generate a summary and start chatting with it.")
+            return
 
-    if not payload.text:
-        st.error("I could not extract text from this PDF. It may be scanned or image-only.")
-        return
+        with st.spinner("Reading PDF..."):
+            payload = read_pdf(uploaded_file)
+
+        if not payload.text:
+            st.error("I could not extract text from this PDF. It may be scanned or image-only.")
+            return
+    else:
+        youtube_url = st.text_input(
+            "YouTube video link",
+            placeholder="https://www.youtube.com/watch?v=...",
+            key="youtube_url",
+        )
+        st.caption("kom dak video thom pek ors luy nh.")
+        max_whisper_minutes = youtube_max_whisper_minutes
+        transcript_languages = youtube_languages
+
+        if not youtube_url:
+            st.info("Paste a YouTube video link above to fetch captions or transcribe audio.")
+            return
+
+        languages = [language.strip() for language in transcript_languages.split(",") if language.strip()]
+        try:
+            with st.spinner("Reading YouTube transcript..."):
+                payload = read_youtube(
+                    youtube_url,
+                    languages or [DEFAULT_YOUTUBE_LANGUAGES],
+                    True,
+                    youtube_whisper_model,
+                    int(max_whisper_minutes),
+                )
+        except Exception as exc:
+            logger.exception("YouTube ingestion failed")
+            st.error(f"YouTube ingestion failed: {exc}")
+            return
 
     if payload.file_hash != st.session_state.active_file_hash:
         st.session_state.messages = []
@@ -741,26 +1003,39 @@ def main() -> None:
         st.session_state.quiz_batch_count = 0
         st.session_state.active_file_hash = payload.file_hash
 
-    docs = split_pdf(payload, chunk_size, chunk_overlap)
+    docs = split_source(payload, chunk_size, chunk_overlap)
 
     col_meta, col_summary = st.columns([1, 2])
     with col_meta:
-        st.subheader("Document")
-        st.write(f"**File:** {payload.file_name}")
-        st.write(f"**Pages:** {payload.page_count}")
+        st.subheader("Source")
+        st.write(f"**Name:** {payload.source_name}")
+        st.write(f"**Type:** {payload.source_type.title()}")
+        if payload.url:
+            st.write(f"**URL:** {payload.url}")
+        if payload.duration_seconds:
+            st.write(f"**Duration:** {format_timestamp(payload.duration_seconds)}")
+        if payload.transcript_source:
+            st.write(f"**Transcript:** {payload.transcript_source}")
+        st.write(f"**Items:** {payload.item_count}")
         st.write(f"**Chunks:** {len(docs)}")
 
     try:
-        index_key = f"{payload.file_hash}:{embedding_backend}:{embedding_model}:{chunk_size}:{chunk_overlap}"
-        with st.spinner("Indexing document..."):
+        index_key = f"{payload.source_type}:{payload.file_hash}:{embedding_backend}:{embedding_model}:{chunk_size}:{chunk_overlap}"
+        with st.spinner("Indexing source..."):
             if index_key != st.session_state.active_index_key:
                 logger.info(
-                    "Indexing %s pages from %s into %s chunks",
-                    payload.page_count,
-                    payload.file_name,
+                    "Indexing %s items from %s into %s chunks",
+                    payload.item_count,
+                    payload.source_name,
                     len(docs),
                 )
-                st.session_state.vector_store = build_vector_store(payload.file_hash, embedding_backend, embedding_model, docs)
+                st.session_state.vector_store = build_vector_store(
+                    payload.source_type,
+                    payload.file_hash,
+                    embedding_backend,
+                    embedding_model,
+                    docs,
+                )
                 st.session_state.active_index_key = index_key
             vector_store = st.session_state.vector_store
         llm = get_llm(provider, model_name, temperature, api_key, max_output_tokens)
@@ -771,7 +1046,10 @@ def main() -> None:
 
     with col_summary:
         st.subheader("Summary")
-        summary_key = f"{payload.file_hash}:{provider}:{model_name}:{summary_chunks}:{summary_max_chars}:{chunk_size}:{chunk_overlap}"
+        summary_key = (
+            f"summary-v2:{payload.source_type}:{payload.file_hash}:{provider}:{model_name}:"
+            f"{summary_chunks}:{summary_max_chars}:{chunk_size}:{chunk_overlap}"
+        )
         if st.session_state.summary and st.session_state.summary_key == summary_key:
             st.markdown(st.session_state.summary)
         else:
@@ -780,7 +1058,7 @@ def main() -> None:
                 prompt = build_summary_prompt(docs, summary_chunks, summary_max_chars)
                 summary_box = st.empty()
                 summary_parts = []
-                with st.spinner("Summarizing PDF..."):
+                with st.spinner("Summarizing source..."):
                     for token in stream_llm_text(llm, prompt):
                         summary_parts.append(token)
                         summary_box.markdown("".join(summary_parts))
@@ -801,7 +1079,7 @@ def main() -> None:
         if st.button("Generate quiz", type="primary", use_container_width=True):
             try:
                 start = time.perf_counter()
-                with st.spinner("Creating quiz from the whole document..."):
+                with st.spinner("Creating quiz from the whole source..."):
                     quiz, batches = generate_quiz(
                         llm,
                         docs,
@@ -828,18 +1106,18 @@ def main() -> None:
             st.markdown(st.session_state.quiz)
 
     with chat_tab:
-        st.subheader("Chat with this PDF")
+        st.subheader("Chat with this source")
         search_full_document = st.toggle(
-            "Search whole document",
+            "Search whole source",
             value=False,
-            help="Use this for broad questions that need every chunk. Broad prompts are also detected automatically. It is slower, but it reads the PDF in batches instead of only retrieving the nearest chunks.",
+            help="Use this for broad questions that need every chunk. Broad prompts are also detected automatically. It is slower, but it reads the source in batches instead of only retrieving the nearest chunks.",
         )
 
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
-        question = st.chat_input("Ask a question about the uploaded PDF")
+        question = st.chat_input("Ask a question about the uploaded source")
         if not question:
             return
 
@@ -855,7 +1133,7 @@ def main() -> None:
                 exhaustive_search = search_full_document or should_search_full_document(question)
 
                 if exhaustive_search:
-                    with st.spinner("Reading the whole PDF in batches..."):
+                    with st.spinner("Reading the whole source in batches..."):
                         answer, batches = answer_from_full_document(llm, question, docs, exhaustive_batch_chars)
                     answer_box.markdown(answer)
                     logger.info(
@@ -864,13 +1142,13 @@ def main() -> None:
                         len(batches),
                         len(answer),
                     )
-                    with st.expander("Document batches scanned"):
+                    with st.expander("Source batches scanned"):
                         st.caption(f"Scanned {len(docs)} chunks in {len(batches)} context-window-sized batches.")
                         for batch_number, batch in enumerate(batches, start=1):
                             st.caption(f"Batch {batch_number}")
                             st.write(batch[:1200])
                 else:
-                    with st.spinner("Searching the PDF..."):
+                    with st.spinner("Searching the source..."):
                         context, sources = retrieve_context(vector_store, question, retrieval_k, max_context_chars)
 
                     prompt = build_qa_prompt(question, context)
