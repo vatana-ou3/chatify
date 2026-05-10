@@ -1,4 +1,5 @@
 import hashlib
+import json
 import logging
 import os
 import re
@@ -100,6 +101,8 @@ def reset_chat() -> None:
     st.session_state.summary = ""
     st.session_state.summary_key = ""
     st.session_state.quiz = ""
+    st.session_state.quiz_items = []
+    st.session_state.quiz_key = ""
     st.session_state.quiz_batch_count = 0
     st.session_state.active_file_hash = ""
     st.session_state.active_index_key = ""
@@ -138,13 +141,14 @@ def read_pdf(uploaded_file) -> SourcePayload:
 def parse_youtube_video_id(url: str) -> str:
     parsed = urlparse(url.strip())
     host = parsed.netloc.lower().removeprefix("www.")
+    path = parsed.path.rstrip("/")
 
     if host == "youtu.be":
         video_id = parsed.path.strip("/").split("/")[0]
-    elif host in {"youtube.com", "m.youtube.com", "music.youtube.com"}:
-        if parsed.path == "/watch":
+    elif host in {"youtube.com", "m.youtube.com", "music.youtube.com", "youtube-nocookie.com"}:
+        if path == "/watch":
             video_id = parse_qs(parsed.query).get("v", [""])[0]
-        elif parsed.path.startswith(("/shorts/", "/embed/")):
+        elif path.startswith(("/shorts/", "/embed/", "/live/")):
             parts = parsed.path.strip("/").split("/")
             video_id = parts[1] if len(parts) > 1 else ""
         else:
@@ -155,6 +159,53 @@ def parse_youtube_video_id(url: str) -> str:
     if not re.fullmatch(r"[\w-]{11}", video_id):
         raise ValueError("Please enter a valid YouTube video URL.")
     return video_id
+
+
+def get_youtube_proxy_url() -> str | None:
+    return (
+        get_config_value("YOUTUBE_PROXY_URL")
+        or get_config_value("YOUTUBE_HTTPS_PROXY")
+        or get_config_value("HTTPS_PROXY")
+        or get_config_value("https_proxy")
+    )
+
+
+def create_youtube_transcript_api():
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+    except ImportError as exc:
+        raise RuntimeError("Install youtube-transcript-api to fetch YouTube captions.") from exc
+
+    webshare_username = get_config_value("WEBSHARE_PROXY_USERNAME")
+    webshare_password = get_config_value("WEBSHARE_PROXY_PASSWORD")
+    if webshare_username and webshare_password:
+        try:
+            from youtube_transcript_api.proxies import WebshareProxyConfig
+        except ImportError as exc:
+            raise RuntimeError("Update youtube-transcript-api to use Webshare proxy support.") from exc
+
+        return YouTubeTranscriptApi(
+            proxy_config=WebshareProxyConfig(
+                proxy_username=webshare_username,
+                proxy_password=webshare_password,
+            )
+        )
+
+    proxy_url = get_youtube_proxy_url()
+    if proxy_url:
+        try:
+            from youtube_transcript_api.proxies import GenericProxyConfig
+        except ImportError as exc:
+            raise RuntimeError("Update youtube-transcript-api to use generic proxy support.") from exc
+
+        return YouTubeTranscriptApi(
+            proxy_config=GenericProxyConfig(
+                http_url=get_config_value("YOUTUBE_HTTP_PROXY") or proxy_url,
+                https_url=proxy_url,
+            )
+        )
+
+    return YouTubeTranscriptApi()
 
 
 def format_timestamp(seconds: float) -> str:
@@ -173,12 +224,7 @@ def segment_value(segment, name: str, default=0):
 
 
 def fetch_youtube_captions(video_id: str, languages: list[str]) -> tuple[str, int]:
-    try:
-        from youtube_transcript_api import YouTubeTranscriptApi
-    except ImportError as exc:
-        raise RuntimeError("Install youtube-transcript-api to fetch YouTube captions.") from exc
-
-    transcript = YouTubeTranscriptApi().fetch(video_id, languages=languages)
+    transcript = create_youtube_transcript_api().fetch(video_id, languages=languages)
     lines = []
     last_end = 0
     for segment in transcript:
@@ -205,6 +251,9 @@ def fetch_youtube_info(url: str) -> dict:
         "skip_download": True,
         "noplaylist": True,
     }
+    proxy_url = get_youtube_proxy_url()
+    if proxy_url:
+        ydl_opts["proxy"] = proxy_url
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=False)
 
@@ -229,6 +278,9 @@ def download_youtube_audio(url: str, output_dir: str) -> str:
             }
         ],
     }
+    proxy_url = get_youtube_proxy_url()
+    if proxy_url:
+        ydl_opts["proxy"] = proxy_url
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.extract_info(url, download=True)
 
@@ -587,32 +639,40 @@ Rules:
 - Keep every question answerable from the document material.
 - Spread questions across the available material when possible.
 - Do not mention information that is not supported by the material.
-- For QCM/MCQ questions, provide 4 options labeled A-D, mark the correct answer, and add a short explanation.
+- For QCM/MCQ questions, provide exactly 4 options labeled A-D, the correct option letter, and a short explanation.
 - For context/open questions, provide the expected answer and a short explanation.
 - If difficulty is Mixed, include a balanced mix of easy, medium, and hard questions.
 - If quiz type is Mixed, include both QCM/MCQ and context/open questions.
 
 Format:
-## Quiz
+Return JSON only. Do not wrap it in markdown fences.
+Use this schema:
+[
+  {{
+    "type": "qcm",
+    "difficulty": "Medium",
+    "question": "Question text",
+    "options": {{"A": "...", "B": "...", "C": "...", "D": "..."}},
+    "answer": "A",
+    "explanation": "Short explanation"
+  }},
+  {{
+    "type": "open",
+    "difficulty": "Medium",
+    "question": "Question text",
+    "expected_answer": "Expected answer",
+    "explanation": "Short explanation"
+  }}
+]
 
-### 1. [Question type] [Difficulty]
-Question text
-
-Options:
-A. ...
-B. ...
-C. ...
-D. ...
-
-Answer: ...
-Explanation: ...
-
-For context/open questions, omit the Options block.
+Use "qcm" for QCM/MCQ questions and "open" for context/open questions.
+For QCM / multiple choice quiz type, every item must be type "qcm".
+For Context questions quiz type, every item must be type "open".
 
 Document material:
 {context}
 
-Quiz:"""
+JSON:"""
 )
 
 
@@ -755,6 +815,27 @@ def answer_from_full_document(llm, question: str, docs: list[Document], max_cont
     return get_llm_text(llm, final_prompt), batches
 
 
+def build_quiz_context(docs: list[Document], question_count: int, max_context_chars: int) -> str:
+    if not docs:
+        return ""
+
+    selected_count = min(len(docs), max(12, question_count * 4))
+    selected_docs = select_summary_docs(docs, selected_count)
+    context_parts = []
+    remaining_chars = max_context_chars
+
+    for doc in selected_docs:
+        if remaining_chars <= 0:
+            break
+        text = doc_label(doc)
+        if len(text) > remaining_chars:
+            text = text[:remaining_chars]
+        context_parts.append(text)
+        remaining_chars -= len(text) + 2
+
+    return "\n\n".join(context_parts)
+
+
 def generate_quiz(
     llm,
     docs: list[Document],
@@ -763,48 +844,143 @@ def generate_quiz(
     difficulty: str,
     max_context_chars: int,
 ) -> tuple[str, list[str]]:
-    batches = pack_docs_for_context(docs, max_context_chars)
-    material_parts = []
-
-    for batch_number, context in enumerate(batches, start=1):
-        prompt = QUIZ_BATCH_PROMPT.format(
-            quiz_type=quiz_type,
-            difficulty=difficulty,
-            question_count=question_count,
-            context=context,
-        )
-        material = get_llm_text(llm, prompt).strip()
-        if material and "no useful quiz material" not in material.lower():
-            material_parts.append(f"[Section {batch_number}]\n{material}")
-
-    if not material_parts:
-        material_parts = ["No useful quiz material was found in the extracted document text."]
-
-    while len("\n\n".join(material_parts)) > max_context_chars and len(material_parts) > 1:
-        reduced_parts = []
-        for context in pack_docs_for_context(
-            [Document(page_content=material, metadata={"chunk": index}) for index, material in enumerate(material_parts)],
-            max_context_chars,
-        ):
-            prompt = QUIZ_BATCH_PROMPT.format(
-                quiz_type=quiz_type,
-                difficulty=difficulty,
-                question_count=question_count,
-                context=context,
-            )
-            reduced = get_llm_text(llm, prompt).strip()
-            if reduced:
-                reduced_parts.append(reduced)
-        material_parts = reduced_parts or material_parts[:1]
-
-    final_context = "\n\n".join(material_parts)[:max_context_chars]
+    final_context = build_quiz_context(docs, question_count, max_context_chars)
     final_prompt = QUIZ_FINAL_PROMPT.format(
         quiz_type=quiz_type,
         difficulty=difficulty,
         question_count=question_count,
         context=final_context,
     )
-    return get_llm_text(llm, final_prompt), batches
+    return get_llm_text(llm, final_prompt), [final_context] if final_context else []
+
+
+def clean_json_text(text: str) -> str:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    start = cleaned.find("[")
+    end = cleaned.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        cleaned = cleaned[start : end + 1]
+    return cleaned
+
+
+def parse_quiz_items(text: str) -> list[dict]:
+    try:
+        raw_items = json.loads(clean_json_text(text))
+    except json.JSONDecodeError:
+        return []
+
+    if not isinstance(raw_items, list):
+        return []
+
+    quiz_items = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+
+        item_type = str(item.get("type", "")).strip().lower()
+        question = str(item.get("question", "")).strip()
+        explanation = str(item.get("explanation", "")).strip()
+        difficulty = str(item.get("difficulty", "")).strip() or "Mixed"
+        if not question:
+            continue
+
+        if item_type in {"qcm", "mcq", "multiple_choice", "multiple choice"}:
+            options = item.get("options", {})
+            if not isinstance(options, dict):
+                continue
+            normalized_options = {
+                letter: str(options.get(letter, "")).strip()
+                for letter in ("A", "B", "C", "D")
+            }
+            answer = str(item.get("answer", "")).strip().upper()[:1]
+            if answer not in normalized_options or not all(normalized_options.values()):
+                continue
+            quiz_items.append(
+                {
+                    "type": "qcm",
+                    "difficulty": difficulty,
+                    "question": question,
+                    "options": normalized_options,
+                    "answer": answer,
+                    "explanation": explanation,
+                }
+            )
+        else:
+            expected_answer = str(item.get("expected_answer") or item.get("answer") or "").strip()
+            if not expected_answer:
+                continue
+            quiz_items.append(
+                {
+                    "type": "open",
+                    "difficulty": difficulty,
+                    "question": question,
+                    "expected_answer": expected_answer,
+                    "explanation": explanation,
+                }
+            )
+
+    return quiz_items
+
+
+def render_interactive_quiz(quiz_items: list[dict], quiz_key: str) -> None:
+    if not quiz_items:
+        return
+
+    score = 0
+    answered_qcm_count = 0
+
+    for index, item in enumerate(quiz_items, start=1):
+        item_key = f"{quiz_key}_{index}"
+        item_type = item.get("type")
+        difficulty = item.get("difficulty", "Mixed")
+
+        st.markdown(f"**{index}. {difficulty}**")
+        st.write(item["question"])
+
+        if item_type == "qcm":
+            options = item["options"]
+            labels = [f"{letter}. {text}" for letter, text in options.items()]
+            selected_label = st.radio(
+                "Choose your answer",
+                labels,
+                key=f"quiz_choice_{item_key}",
+                index=None,
+            )
+            submitted = st.button("Check answer", key=f"quiz_submit_{item_key}")
+            if submitted:
+                st.session_state[f"quiz_checked_{item_key}"] = True
+
+            if st.session_state.get(f"quiz_checked_{item_key}"):
+                if not selected_label:
+                    st.warning("Choose one option first.")
+                else:
+                    selected_letter = selected_label.split(".", 1)[0]
+                    correct_letter = item["answer"]
+                    correct_text = options[correct_letter]
+                    answered_qcm_count += 1
+                    if selected_letter == correct_letter:
+                        score += 1
+                        st.success("Correct.")
+                    else:
+                        st.error(f"Not quite. The correct answer is {correct_letter}. {correct_text}")
+                    if item.get("explanation"):
+                        st.info(item["explanation"])
+        else:
+            st.text_area("Your answer", key=f"quiz_open_answer_{item_key}", height=90)
+            if st.button("Show expected answer", key=f"quiz_reveal_{item_key}"):
+                st.session_state[f"quiz_revealed_{item_key}"] = True
+            if st.session_state.get(f"quiz_revealed_{item_key}"):
+                st.success(f"Expected answer: {item['expected_answer']}")
+                if item.get("explanation"):
+                    st.info(item["explanation"])
+
+        st.divider()
+
+    if answered_qcm_count:
+        st.caption(f"Checked QCM score: {score}/{answered_qcm_count}")
 
 
 def build_qa_prompt(question: str, context: str) -> str:
@@ -880,6 +1056,8 @@ def ensure_session_defaults() -> None:
     st.session_state.setdefault("summary", "")
     st.session_state.setdefault("summary_key", "")
     st.session_state.setdefault("quiz", "")
+    st.session_state.setdefault("quiz_items", [])
+    st.session_state.setdefault("quiz_key", "")
     st.session_state.setdefault("quiz_batch_count", 0)
     st.session_state.setdefault("active_file_hash", "")
     st.session_state.setdefault("active_index_key", "")
@@ -1000,6 +1178,8 @@ def main() -> None:
         st.session_state.summary = ""
         st.session_state.summary_key = ""
         st.session_state.quiz = ""
+        st.session_state.quiz_items = []
+        st.session_state.quiz_key = ""
         st.session_state.quiz_batch_count = 0
         st.session_state.active_file_hash = payload.file_hash
 
@@ -1086,9 +1266,15 @@ def main() -> None:
                         question_count,
                         quiz_type,
                         difficulty,
-                        exhaustive_batch_chars,
+                        max_context_chars,
                     )
+                quiz_items = parse_quiz_items(quiz)
+                quiz_key = hashlib.sha256(
+                    f"{payload.file_hash}:{quiz_type}:{difficulty}:{question_count}:{quiz}".encode("utf-8")
+                ).hexdigest()[:12]
                 st.session_state.quiz = quiz
+                st.session_state.quiz_items = quiz_items
+                st.session_state.quiz_key = quiz_key
                 st.session_state.quiz_batch_count = len(batches)
                 logger.info(
                     "Quiz generated in %.2fs with %s batches and %s characters",
@@ -1098,12 +1284,29 @@ def main() -> None:
                 )
             except Exception as exc:
                 logger.exception("Quiz generation failed")
-                st.error(f"Quiz generation failed: {exc}")
+                error_text = str(exc)
+                if "429" in error_text or "quota" in error_text.lower() or "rate" in error_text.lower():
+                    st.error(
+                        "Quiz generation hit the Gemini free-tier quota. Wait for the retry time in the error, "
+                        "try again later, or switch to another Gemini API key/billing plan."
+                    )
+                    with st.expander("Full quota error"):
+                        st.write(error_text)
+                else:
+                    st.error(f"Quiz generation failed: {exc}")
 
         if st.session_state.quiz:
             if st.session_state.quiz_batch_count:
-                st.caption(f"Quiz generated from {len(docs)} chunks across {st.session_state.quiz_batch_count} batches.")
-            st.markdown(st.session_state.quiz)
+                st.caption(
+                    f"Quiz generated from a sampled source context across {len(docs)} chunks "
+                    f"using {st.session_state.quiz_batch_count} model request"
+                    f"{'' if st.session_state.quiz_batch_count == 1 else 's'}."
+                )
+            if st.session_state.quiz_items:
+                render_interactive_quiz(st.session_state.quiz_items, st.session_state.quiz_key)
+            else:
+                st.warning("I could not turn this quiz into interactive questions, so I am showing the raw quiz.")
+                st.markdown(st.session_state.quiz)
 
     with chat_tab:
         st.subheader("Chat with this source")

@@ -85,6 +85,19 @@ SUMMARY_CHUNKS = "0"
 SUMMARY_MAX_CHARS = "750000"
 ```
 
+Streamlit Cloud may need a proxy for YouTube transcripts because YouTube often blocks requests from cloud-provider IP ranges after some use. If YouTube ingestion starts failing only after deployment, add either:
+
+```toml
+WEBSHARE_PROXY_USERNAME = "your_webshare_residential_proxy_username"
+WEBSHARE_PROXY_PASSWORD = "your_webshare_residential_proxy_password"
+```
+
+or a generic proxy:
+
+```toml
+YOUTUBE_PROXY_URL = "http://user:password@proxy-host:port"
+```
+
 Do not upload `.env`, `.chroma/`, `.fastembed_cache/`, or `.venv/` to GitHub. They are already ignored by `.gitignore`.
 
 ## Notes
@@ -99,4 +112,5 @@ Do not upload `.env`, `.chroma/`, `.fastembed_cache/`, or `.venv/` to GitHub. Th
 - For 30 to 90 page PDFs, indexing will take longer on first upload, but Chroma reuses the saved index on later runs for the same PDF, embedding model, and chunk settings.
 - Scanned PDFs need OCR first because PyPDF2 only extracts embedded text.
 - YouTube caption fetching is fast and does not download media. Whisper fallback is capped by `YOUTUBE_MAX_WHISPER_MINUTES` to avoid accidentally processing very long videos.
+- `packages.txt` installs `ffmpeg` on Streamlit Cloud so the Whisper fallback can convert YouTube audio.
 - The generated explanation samples chunks from across the document so later pages are represented. For very large PDFs, increase `SUMMARY_CHUNKS` or move the explanation step to a background map-reduce job.
